@@ -4,7 +4,7 @@
 
 name = "hclabs-api"
 main = "worker.js"
-compatibility_date = "2026-07-30"
+compatibility_date = "2027-07-30"
 
 [[kv_namespaces]]
 binding = "LICENSE_KV"
