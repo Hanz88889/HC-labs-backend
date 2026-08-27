@@ -1,0 +1,34 @@
+# HC LABS API — konfigurasi Worker
+# Dipakai oleh Cloudflare Workers Builds saat repo GitHub di-connect
+# (Workers & Pages → hclabs-api → Settings → Build → Connect to Git).
+#
+# File yang wajib ikut di-push ke repo: worker.js DAN fal-client.js
+# (worker.js meng-import fal-client.js — Cloudflare Workers Builds
+# otomatis bundle keduanya, tidak perlu konfigurasi tambahan).
+
+name = "hclabs-api"
+main = "worker.js"
+compatibility_date = "2026-07-30"
+
+[[kv_namespaces]]
+binding = "LICENSE_KV"
+id = "GANTI_DENGAN_ID_KV_NAMESPACE_LICENSE_KV"
+# Cara cari ID: dashboard Cloudflare → Storage & Databases → KV →
+# klik namespace LICENSE_KV yang sudah ada → copy "Namespace ID" di situ.
+# JANGAN buat namespace baru — pakai yang sudah ada supaya data lisensi
+# existing tidak hilang.
+
+# ─────────────────────────────────────────────
+# SECRETS — JANGAN pernah ditaruh di file ini (file ini masuk ke Git).
+# Set lewat salah satu cara berikut setelah repo ter-connect:
+#   1. Dashboard: Workers & Pages → hclabs-api → Settings → Variables and Secrets
+#   2. CLI dari Acode: wrangler secret put FAL_KEY
+#                       wrangler secret put ADMIN_SECRET
+#
+# Yang dibutuhkan:
+#   FAL_KEY       -> API key dari https://fal.ai/dashboard/keys
+#   ADMIN_SECRET  -> secret bebas untuk endpoint /api/admin/bulk-import
+#
+# Catatan: IMAGE_PROVIDER / VIDEO_PROVIDER (var lama era DeAPI) sudah tidak
+# dipakai kode baru — boleh dihapus dari Settings → Variables kalau mau beres-beres.
+# ─────────────────────────────────────────────
