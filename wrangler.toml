@@ -11,7 +11,7 @@ main = "worker.js"
 compatibility_date = "2027-07-30"
 
 [[kv_namespaces]]
-binding = "KV_BINDING"
+binding = "LICENSE_KV"
 id = "a02fdfe6cc734c49a0f47549d090d477"
 # Cara cari ID: dashboard Cloudflare → Storage & Databases → KV →
 # klik namespace LICENSE_KV yang sudah ada → copy "Namespace ID" di situ.
