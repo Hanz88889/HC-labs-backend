@@ -6,7 +6,7 @@
 # (worker.js meng-import fal-client.js — Cloudflare Workers Builds
 # otomatis bundle keduanya, tidak perlu konfigurasi tambahan).
 
-name = "hclabs-api"
+name = "hc-labs-api"
 main = "worker.js"
 compatibility_date = "2026-07-30"
 
