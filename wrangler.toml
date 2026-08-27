@@ -8,11 +8,11 @@
 
 name = "hclabs-api"
 main = "worker.js"
-compatibility_date = "2026-07-30"
+compatibility_date = "2027-07-30"
 
 [[kv_namespaces]]
-binding = "LICENSE_KV"
-id = "GANTI_DENGAN_ID_KV_NAMESPACE_LICENSE_KV"
+binding = "KV_BINDING"
+id = "a02fdfe6cc734c49a0f47549d090d477"
 # Cara cari ID: dashboard Cloudflare → Storage & Databases → KV →
 # klik namespace LICENSE_KV yang sudah ada → copy "Namespace ID" di situ.
 # JANGAN buat namespace baru — pakai yang sudah ada supaya data lisensi
