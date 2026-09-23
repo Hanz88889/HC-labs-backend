@@ -50,8 +50,8 @@ const err = (msg, status = 400) => json({ error: msg }, status);
 const TAPER_THRESHOLD = { STD: 10, PRO: 30, STANDARD: 10 };
 
 const HCLABS_TIER_QUOTA = {
-  standard: { image: 150, video: 30 },
-  pro: { image: 300, video: 90 }
+  standard: { image: 100, video: 30 },
+  pro: { image: 250, video: 60 }
 };
 
 function taperThresholdFor(entry) {
