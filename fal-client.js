@@ -26,17 +26,17 @@ export const API = 'https://queue.fal.run';
 // ─────────────────────────────────────────────
 export const ENGINES = {
   imageGenerate: {
-    label: 'Aurum Vision',
+    label: 'HC Labs Image Engine',
     premium: { id: 'fal-ai/nano-banana',  sizing: 'aspect' },   // $0.039/gambar
     budget:  { id: 'fal-ai/flux/schnell', sizing: 'flux'   },   // $0.025/gambar
   },
   imageEdit: {
-    label: 'Aurum Retouch',
+    label: 'HC Labs Edit Engine',
     premium: { id: 'fal-ai/nano-banana/edit', imageField: 'image_urls' }, // $0.039/gambar
     budget:  { id: 'fal-ai/qwen-image-2/edit', imageField: 'image_url'  }, // $0.035/gambar
   },
   videoT2V: {
-    label: 'Aurum Motion',
+    label: 'HC Labs Motion Engine',
     // TEMPORARY (27 Agt 2026): premium DITURUNKAN ke Wan (flat $0.20/video).
     // LTX-2.3 dicabut sementara — harga real dari tagihan ($0.06/detik utk
     // t2v, i2v malah jalan 12 detik bukan 6 yang diminta) gak cocok sama
@@ -46,7 +46,7 @@ export const ENGINES = {
     budget:  { id: 'fal-ai/wan-t2v', family: 'wan' }, // sama — lihat catatan di atas
   },
   videoI2V: {
-    label: 'Aurum Motion',
+    label: 'HC Labs Motion Engine',
     premium: { id: 'fal-ai/wan-i2v', family: 'wan' }, // sama alasan — lihat catatan videoT2V
     budget:  { id: 'fal-ai/wan-i2v', family: 'wan' },
   },
@@ -153,10 +153,9 @@ export async function falSubmit(modelId, input, env) {
   });
   const text = await res.text();
   let data;
-  try { data = JSON.parse(text); } catch { throw new Error(`fal.ai balas bukan JSON: HTTP ${res.status} — ${text.slice(0, 200)}`); }
+  try { data = JSON.parse(text); } catch { throw new Error(`Layanan media mengembalikan response tidak valid (HTTP ${res.status})`); }
   if (!res.ok) {
-    const msg = data.detail?.[0]?.msg || data.detail || data.error || data.message || `HTTP ${res.status} dari fal.ai`;
-    throw new Error(typeof msg === 'string' ? msg : JSON.stringify(msg));
+    throw new Error(`Layanan media menolak permintaan (HTTP ${res.status})`);
   }
   return data; // { request_id, status_url, response_url, queue_position, ... }
 }
@@ -179,7 +178,7 @@ export async function pollFalOnce(modelId, requestId, env) {
 
   const sres = await fetch(`${statusUrl}?logs=0`, { headers: falHeaders(env) });
   const sdata = await sres.json().catch(() => ({}));
-  if (!sres.ok) return { state: 'error', error: sdata.detail?.[0]?.msg || sdata.error || `HTTP ${sres.status} dari fal.ai` };
+  if (!sres.ok) return { state: 'error', error: `Layanan media menolak permintaan (HTTP ${sres.status})` };
   if (sdata.error) return { state: 'error', error: sdata.error };
 
   const status = (sdata.status || '').toUpperCase();
@@ -187,7 +186,7 @@ export async function pollFalOnce(modelId, requestId, env) {
 
   const rres = await fetch(responseUrl, { headers: falHeaders(env) });
   const rdata = await rres.json().catch(() => ({}));
-  if (!rres.ok) return { state: 'error', error: rdata.detail?.[0]?.msg || rdata.error || 'Gagal ambil hasil dari fal.ai' };
+  if (!rres.ok) return { state: 'error', error: `Layanan media gagal mengambil hasil (HTTP ${rres.status})` };
   return { state: 'done', data: rdata };
 }
 
