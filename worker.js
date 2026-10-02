@@ -37,6 +37,8 @@ const CORS = {
   'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-License-Key, X-License-Email, X-Admin-Secret',
 };
 
+const BUILD_VERSION = 'phase-0-kv-sync-2026-10-02';
+
 const json = (data, status = 200) =>
   new Response(JSON.stringify(data), {
     status,
@@ -307,6 +309,9 @@ function handleHealth(env) {
   const kvReady = !!env.hc_kv;
   return json({
     ok: mediaReady && brainReady && kvReady,
+    build: BUILD_VERSION,
+    runtime: 'hclabs',
+    apiVersion: 'v2',
     mediaReady,
     brainReady,
     kvReady,
