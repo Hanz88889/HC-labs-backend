@@ -1,5 +1,7 @@
 const nowIso = () => new Date().toISOString();
 
+import { normalizeIdempotencyKey } from './job-lifecycle.js';
+
 function dbReady(env) {
   return !!env.HC_DB;
 }
@@ -143,4 +145,142 @@ export async function migrateKvLicense(env, key, raw) {
 
 export function d1Status(env) {
   return { configured: dbReady(env), binding: 'HC_DB' };
+}
+
+export async function getIdempotencyRecord(env, key) {
+  if (!dbReady(env)) return null;
+  const normalized = normalizeIdempotencyKey(key);
+  return env.HC_DB.prepare(`
+    SELECT idempotency_key, license_key, job_id, request_hash, status, created_at, updated_at
+    FROM idempotency_keys WHERE idempotency_key = ?1
+  `).bind(normalized).first();
+}
+
+export async function recordGenerationEvent(env, event) {
+  if (!dbReady(env)) return false;
+  await env.HC_DB.prepare(`
+    INSERT OR IGNORE INTO generation_events
+      (event_id, job_id, event_type, from_status, to_status, metadata_json)
+    VALUES (?1,?2,?3,?4,?5,?6)
+  `).bind(
+    event.eventId || crypto.randomUUID(), event.jobId, event.eventType,
+    event.fromStatus || null, event.toStatus || null,
+    event.metadata ? JSON.stringify(event.metadata) : null,
+  ).run();
+  return true;
+}
+
+export async function createGenerationAttempt(env, attempt) {
+  if (!dbReady(env)) return false;
+  await env.HC_DB.prepare(`
+    INSERT INTO generation_attempts (
+      attempt_id,job_id,attempt_no,status,provider,model_id,request_id,
+      input_duration_seconds,output_duration_seconds,resolution,
+      estimated_cost_usd,actual_cost_usd,currency,metadata_json
+    ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+  `).bind(
+    attempt.attemptId || crypto.randomUUID(), attempt.jobId, attempt.attemptNo,
+    attempt.status || 'CREATED', attempt.provider || null, attempt.modelId || null,
+    attempt.requestId || null, attempt.inputDurationSeconds ?? null,
+    attempt.outputDurationSeconds ?? null, attempt.resolution || null,
+    attempt.estimatedCostUsd ?? 0, attempt.actualCostUsd ?? null,
+    attempt.currency || 'USD', attempt.metadata ? JSON.stringify(attempt.metadata) : null,
+  ).run();
+  return true;
+}
+
+export async function recordValidationResult(env, result) {
+  if (!dbReady(env)) return false;
+  await env.HC_DB.prepare(`
+    INSERT INTO validation_results
+      (validation_id,job_id,attempt_id,validation_type,status,failure_code,details_json)
+    VALUES (?1,?2,?3,?4,?5,?6,?7)
+  `).bind(
+    result.validationId || crypto.randomUUID(), result.jobId, result.attemptId || null,
+    result.validationType, result.status, result.failureCode || null,
+    result.details ? JSON.stringify(result.details) : null,
+  ).run();
+  return true;
+}
+
+export async function reserveGenerationAtomic(env, input) {
+  if (!dbReady(env)) return { ok: false, reason: 'D1_UNAVAILABLE' };
+  const idempotencyKey = normalizeIdempotencyKey(input.idempotencyKey);
+  const jobId = input.jobId || crypto.randomUUID();
+  const attemptId = input.attemptId || crypto.randomUUID();
+  const ledgerId = input.ledgerId || crypto.randomUUID();
+  const eventId = input.eventId || crypto.randomUUID();
+  const creditType = input.creditType || 'video';
+  const metadataJson = input.metadata ? JSON.stringify(input.metadata) : null;
+
+  const statements = [
+    env.HC_DB.prepare(`
+      INSERT OR IGNORE INTO idempotency_keys
+        (idempotency_key,license_key,job_id,request_hash,status)
+      VALUES (?1,?2,?3,?4,'ACTIVE')
+    `).bind(idempotencyKey, input.licenseKey, jobId, input.requestHash || null),
+    env.HC_DB.prepare(`
+      UPDATE quota_balances
+      SET available_units = available_units - 1,
+          reserved_units = reserved_units + 1,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE license_key = ?1
+        AND credit_type = ?2
+        AND available_units >= 1
+        AND NOT EXISTS (
+          SELECT 1 FROM idempotency_keys
+          WHERE idempotency_key = ?3 AND job_id <> ?4
+        )
+    `).bind(input.licenseKey, creditType, idempotencyKey, jobId),
+    env.HC_DB.prepare(`
+      INSERT INTO generation_jobs (
+        job_id,license_key,flow,status,provider,model_id,request_id,task_id,
+        prompt_hash,duration_seconds,aspect_ratio,reference_count,reference_strategy
+      )
+      SELECT ?1,?2,?3,'RESERVED',?4,?5,?6,?7,?8,?9,?10,?11,?12
+      WHERE changes() > 0
+    `).bind(
+      jobId, input.licenseKey, input.flow, input.provider || null, input.modelId || null,
+      input.requestId || null, input.taskId || null, input.promptHash || null,
+      input.durationSeconds ?? null, input.aspectRatio || null,
+      input.referenceCount || 0, input.referenceStrategy || null,
+    ),
+    env.HC_DB.prepare(`
+      INSERT INTO generation_attempts
+        (attempt_id,job_id,attempt_no,status,provider,model_id,request_id,
+         input_duration_seconds,resolution,estimated_cost_usd,currency,metadata_json)
+      SELECT ?1,?2,1,'CREATED',?3,?4,?5,?6,?7,?8,?9,?10
+      WHERE changes() > 0
+    `).bind(
+      attemptId, jobId, input.provider || null, input.modelId || null,
+      input.requestId || null, input.inputDurationSeconds ?? null,
+      input.resolution || null, input.estimatedCostUsd ?? 0,
+      input.currency || 'USD', metadataJson,
+    ),
+    env.HC_DB.prepare(`
+      INSERT INTO quota_ledger
+        (ledger_id,license_key,job_id,event_type,credit_type,units,estimated_cost_usd,idempotency_key,metadata_json)
+      SELECT ?1,?2,?3,'RESERVE',?4,1,?5,?6,?7
+      WHERE changes() > 0
+    `).bind(
+      ledgerId, input.licenseKey, jobId, creditType, input.estimatedCostUsd ?? 0,
+      `reserve:${idempotencyKey}`, metadataJson,
+    ),
+    env.HC_DB.prepare(`
+      INSERT INTO generation_events
+        (event_id,job_id,event_type,from_status,to_status,metadata_json)
+      SELECT ?1,?2,'RESERVED','VALIDATING_REQUEST','RESERVED',?3
+      WHERE changes() > 0
+    `).bind(eventId, jobId, metadataJson),
+  ];
+
+  const results = await env.HC_DB.batch(statements);
+  const reservationResult = results?.[1]?.meta || {};
+  const jobResult = results?.[2]?.meta || {};
+  if (Number(reservationResult.changes || 0) !== 1 || Number(jobResult.changes || 0) !== 1) {
+    const existing = await getIdempotencyRecord(env, idempotencyKey);
+    if (existing) return { ok: true, duplicate: true, jobId: existing.job_id, idempotencyKey };
+    return { ok: false, reason: 'QUOTA_UNAVAILABLE' };
+  }
+  return { ok: true, duplicate: false, jobId, attemptId, idempotencyKey };
 }
