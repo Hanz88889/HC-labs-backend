@@ -497,9 +497,13 @@ async function handleVideoGenerate(request, env) {
   let body;
   try { body = await request.json(); } catch { return err('Body JSON tidak valid'); }
 
-  const { prompt, ratio = '16:9', image } = body;
+  const { prompt, ratio = '16:9', image, duration_seconds: requestedDuration, duration = 5 } = body;
   if (!prompt) return err('prompt wajib diisi');
   if (typeof prompt !== 'string' || prompt.length > 8000) return err('prompt terlalu panjang (maksimal 8.000 karakter)', 413);
+  const durationSeconds = Number(requestedDuration ?? duration);
+  if (!Number.isInteger(durationSeconds) || durationSeconds < 2 || durationSeconds > 15) {
+    return err('duration_seconds harus berupa bilangan bulat antara 2 dan 15');
+  }
 
   const flowKey = image ? 'i2v' : 't2v';
   const lockKey = `inflight:${license.key}:${flowKey}`;
@@ -516,12 +520,12 @@ async function handleVideoGenerate(request, env) {
     if (usePremium) await commitPremiumUsage(env, license, flowKey);
 
     let submitData;
-    try { submitData = await submitVideo(modelCfg, { prompt, image, ratio }, env); }
+    try { submitData = await submitVideo(modelCfg, { prompt, image, ratio, duration: durationSeconds }, env); }
     catch { return err('Layanan media gagal menerima permintaan video', 502); }
 
     // Video selalu async (proses 1-3 menit) — langsung balikin taskId
     const taskId = encodeTaskId('video', modelCfg.id, submitData.request_id);
-    return json({ taskId, provider: 'fal' });
+    return json({ taskId, provider: 'fal', duration_seconds: durationSeconds, aspect_ratio: ratio });
   } finally {
     await releaseLock(env, lockKey);
   }

@@ -130,10 +130,23 @@ function buildImageEditInput(modelCfg, { prompt, image }) {
   return { prompt, image_urls: [image], num_images: 1, aspect_ratio: 'auto', output_format: 'png' };
 }
 
-function buildVideoInput(modelCfg, { prompt, image, ratio }) {
+export function videoFramesForDuration(durationSeconds, fps = 16) {
+  const duration = Number(durationSeconds);
+  if (!Number.isFinite(duration) || duration <= 0) throw new Error('duration_seconds harus berupa angka positif');
+  return Math.round(duration * fps) + 1;
+}
+
+export function buildVideoInput(modelCfg, { prompt, image, ratio, duration }) {
   const aspect_ratio = toVideoAspectRatio(ratio);
   if (modelCfg.family === 'wan') {
-    const base = { prompt, resolution: '480p', aspect_ratio, num_frames: 81, frames_per_second: 16 };
+    const frames_per_second = 16;
+    const base = {
+      prompt,
+      resolution: '480p',
+      aspect_ratio,
+      num_frames: videoFramesForDuration(duration ?? 5, frames_per_second),
+      frames_per_second,
+    };
     return image ? { ...base, image_url: image } : base;
   }
   // family: 'ltx' — durasi dikunci 6 detik demi kepastian margin (lihat catatan di worker.js)
