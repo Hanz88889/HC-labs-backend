@@ -96,8 +96,8 @@ function toVideoAspectRatio(ratio) {
 // Di-encode jadi satu string base64url supaya frontend (yang cuma
 // lempar-balik taskId sebagai string buta) tidak perlu diubah.
 // ─────────────────────────────────────────────
-export function encodeTaskId(creditType, modelId, requestId) {
-  const raw = JSON.stringify({ t: creditType, m: modelId, r: requestId });
+export function encodeTaskId(creditType, modelId, requestId, metadata = {}) {
+  const raw = JSON.stringify({ t: creditType, m: modelId, r: requestId, ...metadata });
   return btoa(raw).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 

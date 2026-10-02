@@ -30,6 +30,10 @@ import {
 import { handleBrainRefine } from './brain-router.js';
 import { DEFAULT_BRAIN_MODEL } from './zai-client.js';
 import { providerConfig, selectedProvider } from './llm-router.js';
+import {
+  getD1License, upsertD1License, migrateKvLicense, d1Status,
+  createGenerationJob, updateGenerationJob, recordQuotaLedger,
+} from './d1-store.js';
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -37,7 +41,7 @@ const CORS = {
   'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-License-Key, X-License-Email, X-Admin-Secret',
 };
 
-const BUILD_VERSION = 'phase-0-kv-sync-2026-10-02';
+const BUILD_VERSION = 'phase-3-multiref-d1-2026-10-02';
 
 const json = (data, status = 200) =>
   new Response(JSON.stringify(data), {
@@ -81,6 +85,7 @@ async function commitPremiumUsage(env, license, flowKey) {
   if (!entry.premiumUsage) entry.premiumUsage = { t2i: 0, i2i: 0, t2v: 0, i2v: 0 };
   entry.premiumUsage[flowKey] = (entry.premiumUsage[flowKey] ?? 0) + 1;
   await env.hc_kv.put(license.key, JSON.stringify(entry));
+  await upsertD1License(env, license.key, entry);
 }
 
 // ─────────────────────────────────────────────
@@ -150,12 +155,14 @@ async function getValidLicense(request, env) {
     return { ok: false, error: 'Key dan email wajib diisi', status: 401 };
   }
 
-  const raw = await env.hc_kv.get(key);
-  if (!raw) {
+  const d1License = await getD1License(env, key);
+  const raw = d1License ? null : await env.hc_kv.get(key);
+  if (!raw && !d1License) {
     return { ok: false, error: 'Kode tidak valid', status: 404 };
   }
 
-  const entry = JSON.parse(raw);
+  const entry = d1License?.entry || JSON.parse(raw);
+  if (!d1License && raw) await migrateKvLicense(env, key, raw);
 
   if (entry.status === 'suspended') {
     return { ok: false, error: 'Akun di-suspend. Hubungi admin HC Labs', status: 403 };
@@ -169,7 +176,7 @@ async function getValidLicense(request, env) {
     return { ok: false, error: 'Key belum diaktivasi. Silakan aktivasi lebih dulu', status: 403 };
   }
 
-  return { ok: true, key, entry };
+  return { ok: true, key, entry, source: d1License ? 'd1' : 'kv' };
 }
 
 function hasCredit(entry, type) {
@@ -179,6 +186,7 @@ function hasCredit(entry, type) {
 async function deductCredit(env, key, entry, type) {
   entry.credits[type] = Math.max(0, (entry.credits[type] ?? 0) - 1);
   await env.hc_kv.put(key, JSON.stringify(entry));
+  await upsertD1License(env, key, entry);
 }
 
 // ─────────────────────────────────────────────
@@ -191,10 +199,11 @@ async function handleActivate(request, env) {
   const { key, email } = body;
   if (!key || !email) return err('Key dan email wajib diisi');
 
-  const raw = await env.hc_kv.get(key);
-  if (!raw) return err('Kode tidak valid', 404);
+  const d1License = await getD1License(env, key);
+  const raw = d1License ? null : await env.hc_kv.get(key);
+  if (!raw && !d1License) return err('Kode tidak valid', 404);
 
-  const entry = JSON.parse(raw);
+  const entry = d1License?.entry || JSON.parse(raw);
 
   if (entry.status === 'suspended') {
     return err('Akun di-suspend. Hubungi admin HC Labs', 403);
@@ -210,6 +219,7 @@ async function handleActivate(request, env) {
     entry.bound_at = new Date().toISOString();
     await env.hc_kv.put(key, JSON.stringify(entry));
   }
+  await upsertD1License(env, key, entry);
 
   return json({
     ok: true,
@@ -264,20 +274,54 @@ async function handleBulkImport(request, env) {
   return json({ ok: true, imported: count });
 }
 
+async function handleD1Migration(request, env) {
+  const headerSecret = request.headers.get('X-Admin-Secret')?.trim();
+  const authorization = request.headers.get('Authorization') || '';
+  const bearerSecret = authorization.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
+  const configuredSecret = String(env.ADMIN_SECRET || '').trim();
+  if (!configuredSecret || (![headerSecret, bearerSecret].includes(configuredSecret))) {
+    return err('Unauthorized', 401);
+  }
+  if (!env.HC_DB) return err('D1 belum di-bind ke Worker', 503);
+
+  let cursor;
+  let scanned = 0;
+  let migrated = 0;
+  do {
+    const page = await env.hc_kv.list({ cursor, limit: 1000 });
+    for (const item of page.keys || []) {
+      scanned++;
+      const raw = await env.hc_kv.get(item.name);
+      if (await migrateKvLicense(env, item.name, raw)) migrated++;
+    }
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor);
+  return json({ ok: true, scanned, migrated, d1: d1Status(env) });
+}
+
 // Dipakai oleh route polling yang dipanggil ulang-ulang dari frontend.
 // Kredit dipotong HANYA saat status COMPLETED, dan hanya sekali per requestId.
 async function resolveFalTask(taskId, license, env) {
   const decoded = decodeTaskId(taskId);
   if (!decoded) return { error: 'taskId tidak valid', status: 400 };
 
-  const { t: creditType, m: modelId, r: requestId } = decoded;
+  const { t: creditType, m: modelId, r: requestId, j: jobId } = decoded;
   const r = await pollFalOnce(modelId, requestId, env).catch(() => ({ state: 'error', error: 'Layanan media gagal memproses permintaan' }));
 
-  if (r.state === 'error') return { result: { status: 'error', done: false, failed: true, url: null, error: r.error } };
-  if (r.state === 'pending') return { result: { status: 'in_progress', done: false, failed: false, url: null } };
+  if (r.state === 'error') {
+    await updateGenerationJob(env, jobId, { status: 'FAILED', errorCode: 'MEDIA_ERROR', errorMessage: r.error });
+    return { result: { status: 'error', done: false, failed: true, url: null, error: r.error } };
+  }
+  if (r.state === 'pending') {
+    await updateGenerationJob(env, jobId, { status: 'PROCESSING' });
+    return { result: { status: 'in_progress', done: false, failed: false, url: null } };
+  }
 
   const url = r.data.video?.url || r.data.images?.[0]?.url || findUrl(r.data);
-  if (!url) return { result: { status: 'completed', done: false, failed: true, url: null, error: 'Tidak ada file hasil dari layanan media' } };
+  if (!url) {
+    await updateGenerationJob(env, jobId, { status: 'FAILED', errorCode: 'NO_RESULT', errorMessage: 'Tidak ada file hasil' });
+    return { result: { status: 'completed', done: false, failed: true, url: null, error: 'Tidak ada file hasil dari layanan media' } };
+  }
 
   const chargeFlagKey = `charged:${requestId}`;
   const chargeLockKey = `charge-lock:${requestId}`;
@@ -289,11 +333,22 @@ async function resolveFalTask(taskId, license, env) {
       if (currentEntry && !(await env.hc_kv.get(chargeFlagKey))) {
         await deductCredit(env, license.key, currentEntry, creditType);
         await env.hc_kv.put(chargeFlagKey, '1', { expirationTtl: 86400 });
+        await recordQuotaLedger(env, {
+          licenseKey: license.key,
+          jobId,
+          eventType: 'COMPLETED',
+          creditType,
+          units: -1,
+          idempotencyKey: `charge:${requestId}`,
+          metadata: { request_id: requestId },
+        });
       }
     } finally {
       await releaseLock(env, chargeLockKey);
     }
   }
+
+  await updateGenerationJob(env, jobId, { status: 'COMPLETED', resultUrl: url, completedAt: new Date().toISOString() });
 
   return { result: { status: 'completed', done: true, failed: false, url } };
 }
@@ -307,6 +362,7 @@ function handleHealth(env) {
   const llm = providerConfig(env, llmProvider);
   const brainReady = llm.ready;
   const kvReady = !!env.hc_kv;
+  const d1 = d1Status(env);
   return json({
     ok: mediaReady && brainReady && kvReady,
     build: BUILD_VERSION,
@@ -315,6 +371,8 @@ function handleHealth(env) {
     mediaReady,
     brainReady,
     kvReady,
+    d1Ready: d1.configured,
+    d1Binding: d1.binding,
     imageProvider: 'media-engine',
     videoProvider: 'media-engine',
     brainProvider: 'llm-router',
@@ -497,7 +555,10 @@ async function handleVideoGenerate(request, env) {
   let body;
   try { body = await request.json(); } catch { return err('Body JSON tidak valid'); }
 
-  const { prompt, ratio = '16:9', image, duration_seconds: requestedDuration, duration = 5 } = body;
+  const {
+    prompt, ratio = '16:9', image, duration_seconds: requestedDuration, duration = 5,
+    reference_count = image ? 1 : 0, reference_strategy = image ? 'single-image' : null,
+  } = body;
   if (!prompt) return err('prompt wajib diisi');
   if (typeof prompt !== 'string' || prompt.length > 8000) return err('prompt terlalu panjang (maksimal 8.000 karakter)', 413);
   const durationSeconds = Number(requestedDuration ?? duration);
@@ -524,7 +585,32 @@ async function handleVideoGenerate(request, env) {
     catch { return err('Layanan media gagal menerima permintaan video', 502); }
 
     // Video selalu async (proses 1-3 menit) — langsung balikin taskId
-    const taskId = encodeTaskId('video', modelCfg.id, submitData.request_id);
+    const jobId = crypto.randomUUID();
+    const taskId = encodeTaskId('video', modelCfg.id, submitData.request_id, { j: jobId });
+    await createGenerationJob(env, {
+      jobId,
+      licenseKey: license.key,
+      flow: image ? 'i2v' : 't2v',
+      status: 'SUBMITTED',
+      provider: 'fal',
+      modelId: modelCfg.id,
+      requestId: submitData.request_id,
+      taskId,
+      durationSeconds,
+      aspectRatio: ratio,
+      referenceCount: Number(reference_count) || (image ? 1 : 0),
+      referenceStrategy: reference_strategy,
+    });
+    await recordQuotaLedger(env, {
+      licenseKey: license.key,
+      jobId,
+      eventType: 'RESERVED',
+      creditType: 'video',
+      units: 1,
+      estimatedCostUsd: ESTIMATED_COST_USD[modelCfg.id] ?? 0.25,
+      idempotencyKey: `reserve:${jobId}`,
+      metadata: { flow: image ? 'i2v' : 't2v', reference_count: Number(reference_count) || 0 },
+    });
     return json({ taskId, provider: 'fal', duration_seconds: durationSeconds, aspect_ratio: ratio });
   } finally {
     await releaseLock(env, lockKey);
@@ -614,6 +700,7 @@ export default {
       if (path === '/api/activate'        && request.method === 'POST') return await handleActivate(request, env);
       if (path === '/api/license/status'  && request.method === 'GET')  return await handleLicenseStatus(request, env);
       if (path === '/api/admin/bulk-import' && request.method === 'POST') return await handleBulkImport(request, env);
+      if (path === '/api/admin/migrate-kv-to-d1' && request.method === 'POST') return await handleD1Migration(request, env);
       if (path === '/api/brain/refine'    && request.method === 'POST') return await handleBrainRefineRoute(request, env);
       if (path === '/api/images/generate' && request.method === 'POST') return await handleImageGenerate(request, env);
       if (path === '/api/images/edit'     && request.method === 'POST') return await handleImageEdit(request, env);

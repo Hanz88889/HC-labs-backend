@@ -18,6 +18,12 @@ id = "a02fdfe6cc734c49a0f47549d090d477"
 # JANGAN buat namespace baru — pakai yang sudah ada supaya data lisensi
 # existing tidak hilang.
 
+[[d1_databases]]
+binding = "HC_DB"
+database_name = "hclabs-core"
+database_id = "8f10f3a1-0542-4b4b-a68a-57ad66cadc7a"
+migrations_dir = "migrations"
+
 # ─────────────────────────────────────────────
 # SECRETS — JANGAN pernah ditaruh di file ini (file ini masuk ke Git).
 # Set lewat salah satu cara berikut setelah repo ter-connect:
