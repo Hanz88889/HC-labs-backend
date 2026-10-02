@@ -211,6 +211,7 @@ export async function reserveGenerationAtomic(env, input) {
   const ledgerId = input.ledgerId || crypto.randomUUID();
   const eventId = input.eventId || crypto.randomUUID();
   const creditType = input.creditType || 'video';
+  const maxActiveJobs = Number(input.maxActiveJobs ?? 2);
   const metadataJson = input.metadata ? JSON.stringify(input.metadata) : null;
 
   const statements = [
@@ -227,7 +228,14 @@ export async function reserveGenerationAtomic(env, input) {
         AND credit_type = ?2
         AND available_units >= 1
         AND NOT EXISTS (SELECT 1 FROM idempotency_keys WHERE idempotency_key = ?3)
-    `).bind(input.licenseKey, creditType, idempotencyKey),
+        AND (
+          SELECT COUNT(*) FROM generation_jobs
+          WHERE license_key = ?1
+            AND status IN ('RESERVED','PLANNED','ROUTING','SUBMITTING','SUBMITTED',
+                           'QUEUED','PROCESSING','DOWNLOADING','VALIDATING_OUTPUT',
+                           'CONTENT_VALIDATION','REFINING','RETRY')
+        ) < ?4
+    `).bind(input.licenseKey, creditType, idempotencyKey, maxActiveJobs),
     env.HC_DB.prepare(`
       INSERT INTO generation_jobs (
         job_id,license_key,flow,status,provider,model_id,request_id,task_id,
@@ -281,6 +289,9 @@ export async function reserveGenerationAtomic(env, input) {
   if (Number(reservationResult.changes || 0) !== 1 || Number(jobResult.changes || 0) !== 1) {
     const existing = await getIdempotencyRecord(env, idempotencyKey);
     if (existing) return { ok: true, duplicate: true, jobId: existing.job_id, idempotencyKey };
+    if (await countActiveGenerationJobs(env, input.licenseKey) >= maxActiveJobs) {
+      return { ok: false, reason: 'ACTIVE_LIMIT' };
+    }
     return { ok: false, reason: 'QUOTA_UNAVAILABLE' };
   }
   return { ok: true, duplicate: false, jobId, attemptId, idempotencyKey };
@@ -294,6 +305,38 @@ export async function getGenerationJob(env, jobId) {
            reference_count,reference_strategy,created_at,updated_at,completed_at
     FROM generation_jobs WHERE job_id = ?1
   `).bind(jobId).first();
+}
+
+export async function countActiveGenerationJobs(env, licenseKey) {
+  if (!dbReady(env) || !licenseKey) return 0;
+  const row = await env.HC_DB.prepare(`
+    SELECT COUNT(*) AS active_jobs FROM generation_jobs
+    WHERE license_key = ?1
+      AND status IN ('RESERVED','PLANNED','ROUTING','SUBMITTING','SUBMITTED',
+                     'QUEUED','PROCESSING','DOWNLOADING','VALIDATING_OUTPUT',
+                     'CONTENT_VALIDATION','REFINING','RETRY')
+  `).bind(licenseKey).first();
+  return Number(row?.active_jobs || 0);
+}
+
+export async function updateGenerationAttempt(env, attemptId, patch = {}) {
+  if (!dbReady(env) || !attemptId) return false;
+  const fields = [];
+  const values = [];
+  const allowed = {
+    status: 'status', requestId: 'request_id', errorCode: 'error_code',
+    errorMessage: 'error_message', actualCostUsd: 'actual_cost_usd',
+    outputDurationSeconds: 'output_duration_seconds', completedAt: 'completed_at',
+  };
+  for (const [key, column] of Object.entries(allowed)) {
+    if (patch[key] !== undefined) { fields.push(`${column} = ?`); values.push(patch[key]); }
+  }
+  if (!fields.length) return true;
+  values.push(attemptId);
+  await env.HC_DB.prepare(`
+    UPDATE generation_attempts SET ${fields.join(', ')} WHERE attempt_id = ?
+  `).bind(...values).run();
+  return true;
 }
 
 export async function getQuotaLedgerByIdempotencyKey(env, idempotencyKey) {
@@ -357,6 +400,17 @@ export async function settleGenerationAtomic(env, input) {
         (event_id,job_id,event_type,from_status,to_status,metadata_json)
       SELECT ?1,?2,?3,?4,?5,?6 WHERE changes() = 1
     `).bind(eventId, jobId, settlement, input.fromStatus || null, nextJobStatus, metadataJson),
+    env.HC_DB.prepare(`
+      UPDATE generation_attempts
+      SET status = ?1, actual_cost_usd = COALESCE(?2,actual_cost_usd),
+          error_code = ?3, error_message = ?4,
+          completed_at = COALESCE(?5,CURRENT_TIMESTAMP)
+      WHERE attempt_id = ?6 AND changes() = 1
+    `).bind(
+      settlement === 'COMMIT' ? 'COMPLETED' : 'FAILED', input.actualCostUsd ?? null,
+      input.errorCode || null, input.errorMessage || null, input.completedAt || null,
+      input.attemptId || null,
+    ),
   ]);
 
   const ledgerChanged = Number(results?.[0]?.meta?.changes || 0) === 1;

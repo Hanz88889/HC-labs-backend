@@ -34,7 +34,7 @@ import {
   getD1License, upsertD1License, migrateKvLicense, d1Status,
   createGenerationJob, updateGenerationJob, recordQuotaLedger,
   getGenerationJob, reserveGenerationAtomic, settleGenerationAtomic,
-  recordGenerationEvent,
+  recordGenerationEvent, updateGenerationAttempt,
 } from './d1-store.js';
 
 const CORS = {
@@ -43,7 +43,7 @@ const CORS = {
   'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-License-Key, X-License-Email, X-Admin-Secret, Idempotency-Key',
 };
 
-const BUILD_VERSION = 'phase-4-video-reservation-2026-10-03';
+const BUILD_VERSION = 'phase-4-attempt-guard-2026-10-03';
 
 const json = (data, status = 200) =>
   new Response(JSON.stringify(data), {
@@ -307,13 +307,14 @@ async function resolveFalTask(taskId, license, env) {
   const decoded = decodeTaskId(taskId);
   if (!decoded) return { error: 'taskId tidak valid', status: 400 };
 
-  const { t: creditType, m: modelId, r: requestId, j: jobId } = decoded;
+  const { t: creditType, m: modelId, r: requestId, j: jobId, a: attemptId } = decoded;
   const r = await pollFalOnce(modelId, requestId, env).catch(() => ({ state: 'error', error: 'Layanan media gagal memproses permintaan' }));
 
   if (r.state === 'error') {
     const settled = jobId ? await settleGenerationAtomic(env, {
       licenseKey: license.key,
       jobId,
+      attemptId,
       creditType,
       settlement: 'RELEASE',
       errorCode: 'MEDIA_ERROR',
@@ -327,6 +328,17 @@ async function resolveFalTask(taskId, license, env) {
   }
   if (r.state === 'pending') {
     await updateGenerationJob(env, jobId, { status: 'PROCESSING' });
+    await updateGenerationAttempt(env, attemptId, { status: 'PROCESSING' });
+    if (jobId) {
+      await recordGenerationEvent(env, {
+        eventId: `processing:${jobId}`,
+        jobId,
+        eventType: 'PROCESSING',
+        fromStatus: 'SUBMITTED',
+        toStatus: 'PROCESSING',
+        metadata: { request_id: requestId },
+      });
+    }
     return { result: { status: 'in_progress', done: false, failed: false, url: null } };
   }
 
@@ -335,6 +347,7 @@ async function resolveFalTask(taskId, license, env) {
     const settled = jobId ? await settleGenerationAtomic(env, {
       licenseKey: license.key,
       jobId,
+      attemptId,
       creditType,
       settlement: 'RELEASE',
       errorCode: 'NO_RESULT',
@@ -350,6 +363,7 @@ async function resolveFalTask(taskId, license, env) {
   const committed = jobId ? await settleGenerationAtomic(env, {
     licenseKey: license.key,
     jobId,
+    attemptId,
     creditType,
     settlement: 'COMMIT',
     resultUrl: url,
@@ -625,6 +639,7 @@ async function handleVideoGenerate(request, env) {
       referenceCount,
       referenceStrategy: reference_strategy,
       estimatedCostUsd,
+      maxActiveJobs: 2,
       metadata: { flow: image ? 'i2v' : 't2v', reference_count: referenceCount },
     });
 
@@ -641,6 +656,9 @@ async function handleVideoGenerate(request, env) {
       });
     }
     if (!reservation.ok) {
+      if (reservation.reason === 'ACTIVE_LIMIT') {
+        return err('Maksimal 2 video generation aktif per license. Tunggu job sebelumnya selesai.', 429);
+      }
       if (reservation.reason === 'QUOTA_UNAVAILABLE') {
         return err('Kredit video habis atau sedang dicadangkan oleh generation lain.', 402);
       }
@@ -650,7 +668,8 @@ async function handleVideoGenerate(request, env) {
     const spend = await checkAndRecordSpend(env, modelCfg.id);
     if (!spend.allowed) {
       await settleGenerationAtomic(env, {
-        licenseKey: license.key, jobId, creditType: 'video', settlement: 'RELEASE',
+        licenseKey: license.key, jobId, attemptId: reservation.attemptId,
+        creditType: 'video', settlement: 'RELEASE',
         errorCode: 'COST_BUDGET_EXHAUSTED', errorMessage: 'Batas biaya API harian tercapai',
       });
       return err('Batas biaya API harian tercapai. Coba lagi besok atau hubungi admin.', 503);
@@ -661,16 +680,22 @@ async function handleVideoGenerate(request, env) {
       submitData = await submitVideo(modelCfg, { prompt, image, ratio, duration: durationSeconds }, env);
     } catch {
       await settleGenerationAtomic(env, {
-        licenseKey: license.key, jobId, creditType: 'video', settlement: 'RELEASE',
+        licenseKey: license.key, jobId, attemptId: reservation.attemptId,
+        creditType: 'video', settlement: 'RELEASE',
         errorCode: 'MEDIA_SUBMIT_FAILED', errorMessage: 'Layanan media gagal menerima permintaan video',
       });
       return err('Layanan media gagal menerima permintaan video. Kuota tidak dipotong.', 502);
     }
 
     // Video selalu async (proses 1-3 menit) — langsung balikin taskId
-    const taskId = encodeTaskId('video', modelCfg.id, submitData.request_id, { j: jobId });
+    const taskId = encodeTaskId('video', modelCfg.id, submitData.request_id, {
+      j: jobId, a: reservation.attemptId,
+    });
     await updateGenerationJob(env, jobId, {
       status: 'SUBMITTED', requestId: submitData.request_id, taskId,
+    });
+    await updateGenerationAttempt(env, reservation.attemptId, {
+      status: 'SUBMITTED', requestId: submitData.request_id,
     });
     await recordGenerationEvent(env, {
       jobId, eventType: 'SUBMITTED', fromStatus: 'RESERVED', toStatus: 'SUBMITTED',

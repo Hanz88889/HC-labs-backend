@@ -1,12 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  countActiveGenerationJobs,
   createGenerationAttempt,
   getIdempotencyRecord,
   recordGenerationEvent,
   recordValidationResult,
   reserveGenerationAtomic,
   settleGenerationAtomic,
+  updateGenerationAttempt,
 } from '../d1-store.js';
 
 function fakeDb({ batchResults = [], existing = null } = {}) {
@@ -61,6 +63,8 @@ test('reserveGenerationAtomic builds one D1 batch for reservation and job creati
   assert.equal(db.prepared.length, 7);
   assert.match(db.prepared[1].sql, /UPDATE quota_balances/);
   assert.match(db.prepared[1].sql, /available_units >= 1/);
+  assert.match(db.prepared[1].sql, /COUNT\(\*\) FROM generation_jobs/);
+  assert.match(db.prepared[1].sql, /< \?4/);
   assert.match(db.prepared[2].sql, /INSERT INTO generation_jobs/);
   assert.match(db.prepared[2].sql, /WHERE changes\(\) > 0/);
   assert.match(db.prepared[5].sql, /INSERT INTO quota_ledger/);
@@ -142,4 +146,15 @@ test('reads an idempotency record by normalized key', async () => {
   const result = await getIdempotencyRecord({ HC_DB: db }, ' req-001 ');
   assert.equal(result.job_id, 'JOB-001');
   assert.equal(db.prepared[0].params[0], 'req-001');
+});
+
+test('counts active jobs and updates provider attempt status', async () => {
+  const db = fakeDb({ existing: { active_jobs: 2 } });
+  const env = { HC_DB: db };
+  assert.equal(await countActiveGenerationJobs(env, 'HC-001'), 2);
+  assert.equal(await updateGenerationAttempt(env, 'ATT-001', {
+    status: 'SUBMITTED', requestId: 'provider-001',
+  }), true);
+  assert.match(db.prepared[0].sql, /COUNT\(\*\) AS active_jobs/);
+  assert.match(db.prepared[1].sql, /UPDATE generation_attempts/);
 });
