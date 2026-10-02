@@ -215,10 +215,9 @@ export async function reserveGenerationAtomic(env, input) {
 
   const statements = [
     env.HC_DB.prepare(`
-      INSERT OR IGNORE INTO idempotency_keys
-        (idempotency_key,license_key,job_id,request_hash,status)
-      VALUES (?1,?2,?3,?4,'ACTIVE')
-    `).bind(idempotencyKey, input.licenseKey, jobId, input.requestHash || null),
+      INSERT OR IGNORE INTO quota_balances (license_key,credit_type,available_units)
+      SELECT license_key,?2,credits_video FROM licenses WHERE license_key = ?1
+    `).bind(input.licenseKey, creditType),
     env.HC_DB.prepare(`
       UPDATE quota_balances
       SET available_units = available_units - 1,
@@ -227,11 +226,8 @@ export async function reserveGenerationAtomic(env, input) {
       WHERE license_key = ?1
         AND credit_type = ?2
         AND available_units >= 1
-        AND NOT EXISTS (
-          SELECT 1 FROM idempotency_keys
-          WHERE idempotency_key = ?3 AND job_id <> ?4
-        )
-    `).bind(input.licenseKey, creditType, idempotencyKey, jobId),
+        AND NOT EXISTS (SELECT 1 FROM idempotency_keys WHERE idempotency_key = ?3)
+    `).bind(input.licenseKey, creditType, idempotencyKey),
     env.HC_DB.prepare(`
       INSERT INTO generation_jobs (
         job_id,license_key,flow,status,provider,model_id,request_id,task_id,
@@ -245,6 +241,11 @@ export async function reserveGenerationAtomic(env, input) {
       input.durationSeconds ?? null, input.aspectRatio || null,
       input.referenceCount || 0, input.referenceStrategy || null,
     ),
+    env.HC_DB.prepare(`
+      INSERT INTO idempotency_keys
+        (idempotency_key,license_key,job_id,request_hash,status)
+      SELECT ?1,?2,?3,?4,'ACTIVE' WHERE changes() > 0
+    `).bind(idempotencyKey, input.licenseKey, jobId, input.requestHash || null),
     env.HC_DB.prepare(`
       INSERT INTO generation_attempts
         (attempt_id,job_id,attempt_no,status,provider,model_id,request_id,
@@ -283,4 +284,88 @@ export async function reserveGenerationAtomic(env, input) {
     return { ok: false, reason: 'QUOTA_UNAVAILABLE' };
   }
   return { ok: true, duplicate: false, jobId, attemptId, idempotencyKey };
+}
+
+export async function getGenerationJob(env, jobId) {
+  if (!dbReady(env) || !jobId) return null;
+  return env.HC_DB.prepare(`
+    SELECT job_id,license_key,flow,status,provider,model_id,request_id,task_id,
+           result_url,error_code,error_message,duration_seconds,aspect_ratio,
+           reference_count,reference_strategy,created_at,updated_at,completed_at
+    FROM generation_jobs WHERE job_id = ?1
+  `).bind(jobId).first();
+}
+
+export async function getQuotaLedgerByIdempotencyKey(env, idempotencyKey) {
+  if (!dbReady(env) || !idempotencyKey) return null;
+  return env.HC_DB.prepare(`
+    SELECT ledger_id,license_key,job_id,event_type,credit_type,units,metadata_json
+    FROM quota_ledger WHERE idempotency_key = ?1
+  `).bind(idempotencyKey).first();
+}
+
+export async function settleGenerationAtomic(env, input) {
+  if (!dbReady(env)) return { ok: false, reason: 'D1_UNAVAILABLE' };
+  if (!['COMMIT', 'RELEASE'].includes(input.settlement)) {
+    throw new Error(`Invalid settlement: ${input.settlement}`);
+  }
+  const jobId = input.jobId;
+  const creditType = input.creditType || 'video';
+  const settlement = input.settlement;
+  const ledgerKey = `settle:${jobId}:${settlement}`;
+  const ledgerId = input.ledgerId || crypto.randomUUID();
+  const eventId = input.eventId || crypto.randomUUID();
+  const metadataJson = input.metadata ? JSON.stringify(input.metadata) : null;
+  const nextJobStatus = settlement === 'COMMIT' ? 'COMPLETED' : 'FAILED';
+
+  const results = await env.HC_DB.batch([
+    env.HC_DB.prepare(`
+      INSERT OR IGNORE INTO quota_ledger
+        (ledger_id,license_key,job_id,event_type,credit_type,units,estimated_cost_usd,idempotency_key,metadata_json)
+      SELECT ?1,?2,?3,?4,?5,0,?6,?7,?8
+      WHERE EXISTS (
+        SELECT 1 FROM quota_balances
+        WHERE license_key = ?2 AND credit_type = ?5 AND reserved_units >= 1
+      )
+    `).bind(
+      ledgerId, input.licenseKey, jobId, settlement, creditType,
+      input.actualCostUsd ?? input.estimatedCostUsd ?? 0, ledgerKey, metadataJson,
+    ),
+    env.HC_DB.prepare(`
+      UPDATE quota_balances
+      SET reserved_units = reserved_units - 1,
+          ${settlement === 'COMMIT' ? 'committed_units' : 'released_units'} =
+            ${settlement === 'COMMIT' ? 'committed_units' : 'released_units'} + 1,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE license_key = ?1 AND credit_type = ?2 AND reserved_units >= 1
+        AND changes() = 1
+        AND EXISTS (SELECT 1 FROM quota_ledger WHERE idempotency_key = ?3)
+    `).bind(input.licenseKey, creditType, ledgerKey),
+    env.HC_DB.prepare(`
+      UPDATE generation_jobs
+      SET status = ?1, result_url = COALESCE(?2,result_url), error_code = ?3,
+          error_message = ?4, completed_at = CASE WHEN ?1 IN ('COMPLETED','FAILED')
+            THEN COALESCE(completed_at,CURRENT_TIMESTAMP) ELSE completed_at END,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE job_id = ?5 AND changes() = 1
+    `).bind(
+      nextJobStatus, input.resultUrl || null, input.errorCode || null,
+      input.errorMessage || null, jobId,
+    ),
+    env.HC_DB.prepare(`
+      INSERT INTO generation_events
+        (event_id,job_id,event_type,from_status,to_status,metadata_json)
+      SELECT ?1,?2,?3,?4,?5,?6 WHERE changes() = 1
+    `).bind(eventId, jobId, settlement, input.fromStatus || null, nextJobStatus, metadataJson),
+  ]);
+
+  const ledgerChanged = Number(results?.[0]?.meta?.changes || 0) === 1;
+  const balanceChanged = Number(results?.[1]?.meta?.changes || 0) === 1;
+  if (ledgerChanged && balanceChanged) {
+    return { ok: true, duplicate: false, settlement, jobId };
+  }
+
+  const existing = await getQuotaLedgerByIdempotencyKey(env, ledgerKey);
+  if (existing) return { ok: true, duplicate: true, settlement, jobId };
+  return { ok: false, reason: 'NO_RESERVATION', jobId };
 }

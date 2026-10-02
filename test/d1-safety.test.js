@@ -6,6 +6,7 @@ import {
   recordGenerationEvent,
   recordValidationResult,
   reserveGenerationAtomic,
+  settleGenerationAtomic,
 } from '../d1-store.js';
 
 function fakeDb({ batchResults = [], existing = null } = {}) {
@@ -33,7 +34,7 @@ function fakeDb({ batchResults = [], existing = null } = {}) {
 }
 
 test('reserveGenerationAtomic builds one D1 batch for reservation and job creation', async () => {
-  const db = fakeDb({ batchResults: Array.from({ length: 6 }, () => ({ success: true, meta: { changes: 1 } })) });
+  const db = fakeDb({ batchResults: Array.from({ length: 7 }, () => ({ success: true, meta: { changes: 1 } })) });
   const out = await reserveGenerationAtomic({ HC_DB: db }, {
     licenseKey: 'HC-001',
     idempotencyKey: 'req-001',
@@ -57,17 +58,18 @@ test('reserveGenerationAtomic builds one D1 batch for reservation and job creati
     attemptId: out.attemptId,
     idempotencyKey: 'req-001',
   });
-  assert.equal(db.prepared.length, 6);
+  assert.equal(db.prepared.length, 7);
   assert.match(db.prepared[1].sql, /UPDATE quota_balances/);
   assert.match(db.prepared[1].sql, /available_units >= 1/);
   assert.match(db.prepared[2].sql, /INSERT INTO generation_jobs/);
   assert.match(db.prepared[2].sql, /WHERE changes\(\) > 0/);
-  assert.match(db.prepared[4].sql, /INSERT INTO quota_ledger/);
+  assert.match(db.prepared[5].sql, /INSERT INTO quota_ledger/);
 });
 
 test('reserveGenerationAtomic returns the existing job for a duplicate idempotency key', async () => {
   const db = fakeDb({
     batchResults: [
+      { success: true, meta: { changes: 0 } },
       { success: true, meta: { changes: 0 } },
       { success: true, meta: { changes: 0 } },
       { success: true, meta: { changes: 0 } },
@@ -109,6 +111,30 @@ test('records generation event, attempt, and validation through D1', async () =>
   assert.match(db.prepared[0].sql, /generation_events/);
   assert.match(db.prepared[1].sql, /generation_attempts/);
   assert.match(db.prepared[2].sql, /validation_results/);
+});
+
+test('settles a reserved generation exactly once', async () => {
+  const db = fakeDb({
+    batchResults: Array.from({ length: 4 }, () => ({ success: true, meta: { changes: 1 } })),
+  });
+  const out = await settleGenerationAtomic({ HC_DB: db }, {
+    licenseKey: 'HC-001', jobId: 'JOB-001', settlement: 'COMMIT',
+    resultUrl: 'https://example.com/video.mp4', actualCostUsd: 0.22,
+  });
+  assert.deepEqual(out, { ok: true, duplicate: false, settlement: 'COMMIT', jobId: 'JOB-001' });
+  assert.match(db.prepared[0].sql, /INSERT OR IGNORE INTO quota_ledger/);
+  assert.match(db.prepared[1].sql, /reserved_units = reserved_units - 1/);
+  assert.match(db.prepared[2].sql, /status = \?1/);
+});
+
+test('returns NO_RESERVATION when settlement has no matching reserved balance', async () => {
+  const db = fakeDb({
+    batchResults: Array.from({ length: 4 }, () => ({ success: true, meta: { changes: 0 } })),
+  });
+  const out = await settleGenerationAtomic({ HC_DB: db }, {
+    licenseKey: 'HC-001', jobId: 'JOB-OLD', settlement: 'RELEASE',
+  });
+  assert.deepEqual(out, { ok: false, reason: 'NO_RESERVATION', jobId: 'JOB-OLD' });
 });
 
 test('reads an idempotency record by normalized key', async () => {
