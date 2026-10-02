@@ -30,6 +30,7 @@ import {
 import { handleBrainRefine } from './brain-router.js';
 import { DEFAULT_BRAIN_MODEL } from './zai-client.js';
 import { providerConfig, selectedProvider } from './llm-router.js';
+import { elapsedSeconds, shouldExpireGeneration } from './job-lifecycle.js';
 import {
   getD1License, upsertD1License, migrateKvLicense, d1Status,
   createGenerationJob, updateGenerationJob, recordQuotaLedger,
@@ -43,7 +44,7 @@ const CORS = {
   'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-License-Key, X-License-Email, X-Admin-Secret, Idempotency-Key',
 };
 
-const BUILD_VERSION = 'phase-4-attempt-guard-2026-10-03';
+const BUILD_VERSION = 'phase-4-timeout-retry-policy-2026-10-03';
 
 const json = (data, status = 200) =>
   new Response(JSON.stringify(data), {
@@ -308,6 +309,8 @@ async function resolveFalTask(taskId, license, env) {
   if (!decoded) return { error: 'taskId tidak valid', status: 400 };
 
   const { t: creditType, m: modelId, r: requestId, j: jobId, a: attemptId } = decoded;
+  const job = jobId ? await getGenerationJob(env, jobId).catch(() => null) : null;
+  const elapsed = elapsedSeconds(job?.created_at);
   const r = await pollFalOnce(modelId, requestId, env).catch(() => ({ state: 'error', error: 'Layanan media gagal memproses permintaan' }));
 
   if (r.state === 'error') {
@@ -324,9 +327,38 @@ async function resolveFalTask(taskId, license, env) {
     if (!settled.ok) {
       await updateGenerationJob(env, jobId, { status: 'FAILED', errorCode: 'MEDIA_ERROR', errorMessage: r.error });
     }
-    return { result: { status: 'error', done: false, failed: true, url: null, error: r.error } };
+    return { result: { status: 'error', stage: 'failed', elapsed_seconds: elapsed, done: false, failed: true, url: null, error: r.error } };
   }
   if (r.state === 'pending') {
+    if (job?.created_at && shouldExpireGeneration(job.created_at)) {
+      const expired = await settleGenerationAtomic(env, {
+        licenseKey: license.key,
+        jobId,
+        attemptId,
+        creditType,
+        settlement: 'RELEASE',
+        terminalStatus: 'EXPIRED',
+        attemptStatus: 'EXPIRED',
+        errorCode: 'TIMEOUT',
+        errorMessage: 'Generation melebihi batas waktu pemrosesan',
+        metadata: { request_id: requestId, elapsed_seconds: elapsed },
+      }).catch(() => ({ ok: false }));
+      if (!expired.ok) {
+        await updateGenerationJob(env, jobId, {
+          status: 'EXPIRED', errorCode: 'TIMEOUT',
+          errorMessage: 'Generation melebihi batas waktu pemrosesan',
+        });
+        await updateGenerationAttempt(env, attemptId, {
+          status: 'EXPIRED', errorCode: 'TIMEOUT',
+          errorMessage: 'Generation melebihi batas waktu pemrosesan',
+          completedAt: new Date().toISOString(),
+        });
+      }
+      return { result: {
+        status: 'expired', stage: 'timeout', elapsed_seconds: elapsed,
+        done: false, failed: true, url: null, error: 'Generation timeout',
+      } };
+    }
     await updateGenerationJob(env, jobId, { status: 'PROCESSING' });
     await updateGenerationAttempt(env, attemptId, { status: 'PROCESSING' });
     if (jobId) {
@@ -339,7 +371,7 @@ async function resolveFalTask(taskId, license, env) {
         metadata: { request_id: requestId },
       });
     }
-    return { result: { status: 'in_progress', done: false, failed: false, url: null } };
+    return { result: { status: 'in_progress', stage: 'processing', elapsed_seconds: elapsed, done: false, failed: false, url: null } };
   }
 
   const url = r.data.video?.url || r.data.images?.[0]?.url || findUrl(r.data);
@@ -357,7 +389,7 @@ async function resolveFalTask(taskId, license, env) {
     if (!settled.ok) {
       await updateGenerationJob(env, jobId, { status: 'FAILED', errorCode: 'NO_RESULT', errorMessage: 'Tidak ada file hasil' });
     }
-    return { result: { status: 'completed', done: false, failed: true, url: null, error: 'Tidak ada file hasil dari layanan media' } };
+    return { result: { status: 'failed', stage: 'failed', elapsed_seconds: elapsed, done: false, failed: true, url: null, error: 'Tidak ada file hasil dari layanan media' } };
   }
 
   const committed = jobId ? await settleGenerationAtomic(env, {
@@ -370,7 +402,7 @@ async function resolveFalTask(taskId, license, env) {
     metadata: { request_id: requestId, result_url: url },
   }).catch(() => ({ ok: false })) : { ok: false };
   if (committed.ok) {
-    return { result: { status: 'completed', done: true, failed: false, url } };
+    return { result: { status: 'completed', stage: 'completed', elapsed_seconds: elapsed, done: true, failed: false, url } };
   }
 
   const chargeFlagKey = `charged:${requestId}`;

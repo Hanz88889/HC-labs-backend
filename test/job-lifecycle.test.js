@@ -1,14 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  GENERATION_POLICY,
   JOB_STATES,
   QUOTA_EVENTS,
   QUOTA_STATES,
   assertSingleFinalSettlement,
   canTransitionJob,
   idempotencyRecord,
+  elapsedSeconds,
   normalizeIdempotencyKey,
+  retryDecision,
   settleQuota,
+  shouldExpireGeneration,
   transitionJob,
 } from '../job-lifecycle.js';
 
@@ -93,4 +97,21 @@ test('rejects missing, malformed, and oversized idempotency keys', () => {
   assert.throws(() => normalizeIdempotencyKey(''), /required/);
   assert.throws(() => normalizeIdempotencyKey('bad key'), /invalid characters/);
   assert.throws(() => normalizeIdempotencyKey('x'.repeat(201)), /too long/);
+});
+
+test('expires durable jobs after the configured timeout', () => {
+  const createdAt = '2026-10-03T00:00:00.000Z';
+  const now = Date.parse('2026-10-03T00:06:00.000Z');
+  assert.equal(GENERATION_POLICY.timeoutSeconds, 360);
+  assert.equal(elapsedSeconds(createdAt, now), 360);
+  assert.equal(shouldExpireGeneration(createdAt, now), true);
+  assert.equal(shouldExpireGeneration(createdAt, now - 1000), false);
+});
+
+test('allows one controlled provider retry only for retryable failures', () => {
+  assert.deepEqual(retryDecision({ failureCode: 'MEDIA_ERROR', attemptNo: 1 }), {
+    retryable: true, allowed: true, nextAttemptNo: 2, reason: 'policy-eligible',
+  });
+  assert.equal(retryDecision({ failureCode: 'MEDIA_ERROR', attemptNo: 2 }).allowed, false);
+  assert.equal(retryDecision({ failureCode: 'USER_CANCELLED', attemptNo: 1 }).allowed, false);
 });

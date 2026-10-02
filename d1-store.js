@@ -359,7 +359,10 @@ export async function settleGenerationAtomic(env, input) {
   const ledgerId = input.ledgerId || crypto.randomUUID();
   const eventId = input.eventId || crypto.randomUUID();
   const metadataJson = input.metadata ? JSON.stringify(input.metadata) : null;
-  const nextJobStatus = settlement === 'COMMIT' ? 'COMPLETED' : 'FAILED';
+  const nextJobStatus = settlement === 'COMMIT' ? 'COMPLETED' : (input.terminalStatus || 'FAILED');
+  if (!['COMPLETED', 'FAILED', 'EXPIRED'].includes(nextJobStatus)) {
+    throw new Error(`Invalid terminal status: ${nextJobStatus}`);
+  }
 
   const results = await env.HC_DB.batch([
     env.HC_DB.prepare(`
@@ -387,7 +390,7 @@ export async function settleGenerationAtomic(env, input) {
     env.HC_DB.prepare(`
       UPDATE generation_jobs
       SET status = ?1, result_url = COALESCE(?2,result_url), error_code = ?3,
-          error_message = ?4, completed_at = CASE WHEN ?1 IN ('COMPLETED','FAILED')
+          error_message = ?4, completed_at = CASE WHEN ?1 IN ('COMPLETED','FAILED','EXPIRED')
             THEN COALESCE(completed_at,CURRENT_TIMESTAMP) ELSE completed_at END,
           updated_at = CURRENT_TIMESTAMP
       WHERE job_id = ?5 AND changes() = 1
@@ -407,7 +410,7 @@ export async function settleGenerationAtomic(env, input) {
           completed_at = COALESCE(?5,CURRENT_TIMESTAMP)
       WHERE attempt_id = ?6 AND changes() = 1
     `).bind(
-      settlement === 'COMMIT' ? 'COMPLETED' : 'FAILED', input.actualCostUsd ?? null,
+      input.attemptStatus || (settlement === 'COMMIT' ? 'COMPLETED' : 'FAILED'), input.actualCostUsd ?? null,
       input.errorCode || null, input.errorMessage || null, input.completedAt || null,
       input.attemptId || null,
     ),

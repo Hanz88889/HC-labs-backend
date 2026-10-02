@@ -32,6 +32,39 @@ export const QUOTA_EVENTS = Object.freeze({
   RELEASE: 'RELEASE',
 });
 
+export const GENERATION_POLICY = Object.freeze({
+  timeoutSeconds: 360,
+  maxAutomaticRefinementRetries: 1,
+  maxProviderAttempts: 2,
+  maxActiveJobsPerLicense: 2,
+});
+
+const RETRYABLE_FAILURE_CODES = new Set([
+  'MEDIA_ERROR', 'MEDIA_SUBMIT_FAILED', 'NO_RESULT', 'TIMEOUT',
+  'TECHNICAL_VALIDATION_FAILED', 'KNOWN_QUALITY_FAILURE',
+]);
+
+export function elapsedSeconds(createdAt, now = Date.now()) {
+  const created = Date.parse(createdAt || '');
+  if (!Number.isFinite(created)) return 0;
+  return Math.max(0, Math.floor((now - created) / 1000));
+}
+
+export function shouldExpireGeneration(createdAt, now = Date.now(), timeoutSeconds = GENERATION_POLICY.timeoutSeconds) {
+  return elapsedSeconds(createdAt, now) >= timeoutSeconds;
+}
+
+export function retryDecision({ failureCode, attemptNo = 1, maxAttempts = GENERATION_POLICY.maxProviderAttempts }) {
+  const normalizedAttempt = Number(attemptNo) || 1;
+  const retryable = RETRYABLE_FAILURE_CODES.has(String(failureCode || '').toUpperCase());
+  return {
+    retryable,
+    allowed: retryable && normalizedAttempt < maxAttempts,
+    nextAttemptNo: normalizedAttempt + 1,
+    reason: retryable ? 'policy-eligible' : 'non-retryable-failure',
+  };
+}
+
 const TERMINAL_JOB_STATES = new Set([
   JOB_STATES.COMPLETED,
   JOB_STATES.FAILED,
