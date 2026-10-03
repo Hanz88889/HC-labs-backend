@@ -32,7 +32,7 @@ import { DEFAULT_BRAIN_MODEL } from './zai-client.js';
 import { providerConfig, selectedProvider } from './llm-router.js';
 import { GENERATION_POLICY, elapsedSeconds, shouldExpireGeneration } from './job-lifecycle.js';
 import {
-  getD1License, upsertD1License, migrateKvLicense, d1Status,
+  getD1License, getD1QuotaBalances, upsertD1License, migrateKvLicense, d1Status,
   updateGenerationJob, recordQuotaLedger,
   getGenerationJob, reserveGenerationAtomic, settleGenerationAtomic,
   recordGenerationEvent, updateGenerationAttempt,
@@ -186,10 +186,6 @@ async function getValidLicense(request, env) {
   return { ok: true, key, entry, source: d1License ? 'd1' : 'kv' };
 }
 
-function hasCredit(entry, type) {
-  return (entry.credits?.[type] ?? 0) > 0;
-}
-
 async function deductCredit(env, key, entry, type) {
   entry.credits[type] = Math.max(0, (entry.credits[type] ?? 0) - 1);
   await env.hc_kv.put(key, JSON.stringify(entry));
@@ -248,10 +244,20 @@ async function handleLicenseStatus(request, env) {
   const check = await getValidLicense(request, env);
   if (!check.ok) return err(check.error, check.status);
 
+  const credits = { ...(check.entry.credits || {}) };
+  if (check.source === 'd1') {
+    const balances = await getD1QuotaBalances(env, check.key).catch(() => []);
+    for (const balance of balances) {
+      if (balance.credit_type === 'image' || balance.credit_type === 'video') {
+        credits[balance.credit_type] = Number(balance.available_units || 0);
+      }
+    }
+  }
+
   return json({
     ok: true,
     tier: check.entry.tier,
-    credits: check.entry.credits,
+    credits,
     limit: check.entry.limit,
     reset_date: check.entry.reset_date,
   });
@@ -530,9 +536,6 @@ async function handleModels(env) {
 async function handleImageGenerate(request, env) {
   const license = await getValidLicense(request, env);
   if (!license.ok) return err(license.error, license.status);
-  if (!hasCredit(license.entry, 'image')) {
-    return err('Kredit image habis bulan ini. Hubungi admin HC Labs untuk upgrade', 402);
-  }
 
   let body;
   try { body = await request.json(); } catch { return err('Body JSON tidak valid'); }
@@ -549,27 +552,101 @@ async function handleImageGenerate(request, env) {
   try {
     const { modelCfg, usePremium } = decideEngine(license, 't2i', ENGINES.imageGenerate);
     const label = ENGINES.imageGenerate.label;
+    const idempotencyKey = request.headers.get('Idempotency-Key') || crypto.randomUUID();
+    const jobId = crypto.randomUUID();
+    const estimatedCostUsd = ESTIMATED_COST_USD[modelCfg.id] ?? 0.25;
+    const reservation = await reserveGenerationAtomic(env, {
+      licenseKey: license.key,
+      idempotencyKey,
+      jobId,
+      flow: 't2i',
+      provider: 'fal',
+      modelId: modelCfg.id,
+      creditType: 'image',
+      estimatedCostUsd,
+      maxActiveJobs: GENERATION_POLICY.maxActiveJobsPerLicense,
+    });
+
+    if (reservation.duplicate) {
+      const existing = await getGenerationJob(env, reservation.jobId);
+      if (!existing) return err('Generation idempotency record tidak lengkap, coba lagi.', 409);
+      if (existing.status === 'COMPLETED' && existing.result_url) {
+        return json({ type: 'url', url: existing.result_url, provider: 'fal', engine: label, duplicate: true });
+      }
+      if (!existing.task_id) return err('Generation idempotency record belum memiliki task.', 409);
+      return json({ pending: true, taskId: existing.task_id, provider: 'fal', duplicate: true });
+    }
+    if (!reservation.ok) {
+      if (reservation.reason === 'ACTIVE_LIMIT') return err('Maksimal generation aktif tercapai. Tunggu job sebelumnya selesai.', 429);
+      if (reservation.reason === 'QUOTA_UNAVAILABLE') return err('Kredit image habis atau sedang dicadangkan oleh generation lain.', 402);
+      return err('Quota safety layer belum siap. Generation tidak dikirim ke provider.', 503);
+    }
 
     const spend = await checkAndRecordSpend(env, modelCfg.id);
-    if (!spend.allowed) return err('Batas biaya API harian tercapai. Coba lagi besok atau hubungi admin.', 503);
+    if (!spend.allowed) {
+      await settleGenerationAtomic(env, {
+        licenseKey: license.key, jobId, attemptId: reservation.attemptId,
+        creditType: 'image', settlement: 'RELEASE',
+        errorCode: 'COST_BUDGET_EXHAUSTED', errorMessage: 'Batas biaya API harian tercapai',
+      });
+      return err('Batas biaya API harian tercapai. Coba lagi besok atau hubungi admin.', 503);
+    }
 
     let submitData;
     try { submitData = await submitImageGenerate(modelCfg, { prompt, size }, env); }
-    catch { return err('Layanan media gagal menerima permintaan gambar', 502); }
+    catch {
+      await settleGenerationAtomic(env, {
+        licenseKey: license.key, jobId, attemptId: reservation.attemptId,
+        creditType: 'image', settlement: 'RELEASE',
+        errorCode: 'MEDIA_SUBMIT_FAILED', errorMessage: 'Layanan media gagal menerima permintaan gambar',
+      });
+      return err('Layanan media gagal menerima permintaan gambar. Kuota tidak dipotong.', 502);
+    }
     if (usePremium) await commitPremiumUsage(env, license, 't2i');
+
+    const taskId = encodeTaskId('image', modelCfg.id, submitData.request_id, {
+      j: jobId, a: reservation.attemptId,
+    });
+    await updateGenerationJob(env, jobId, { status: 'SUBMITTED', requestId: submitData.request_id, taskId });
+    await updateGenerationAttempt(env, reservation.attemptId, { status: 'SUBMITTED', requestId: submitData.request_id });
+    await recordGenerationEvent(env, {
+      jobId, eventType: 'SUBMITTED', fromStatus: 'RESERVED', toStatus: 'SUBMITTED',
+      metadata: { request_id: submitData.request_id },
+    });
 
     const r = await pollFalSync(modelCfg.id, submitData.request_id, env);
 
-    if (r.state === 'error') return err('Layanan media gagal menghasilkan gambar', 502);
+    if (r.state === 'error') {
+      const settled = await settleGenerationAtomic(env, {
+        licenseKey: license.key, jobId, attemptId: reservation.attemptId,
+        creditType: 'image', settlement: 'RELEASE',
+        errorCode: 'MEDIA_ERROR', errorMessage: r.error,
+        metadata: { request_id: submitData.request_id },
+      });
+      if (!settled.ok) return err('Settlement quota belum selesai; coba polling ulang.', 503);
+      return err('Layanan media gagal menghasilkan gambar', 502);
+    }
 
     if (r.state === 'done') {
       const url = r.data.images?.[0]?.url || findUrl(r.data);
-      if (!url) return err('Tidak ada gambar dari layanan media', 502);
-      await deductCredit(env, license.key, license.entry, 'image');
+      if (!url) {
+        const settled = await settleGenerationAtomic(env, {
+          licenseKey: license.key, jobId, attemptId: reservation.attemptId,
+          creditType: 'image', settlement: 'RELEASE', errorCode: 'NO_RESULT',
+          errorMessage: 'Tidak ada gambar dari layanan media',
+        });
+        if (!settled.ok) return err('Settlement quota belum selesai; coba polling ulang.', 503);
+        return err('Tidak ada gambar dari layanan media', 502);
+      }
+      const committed = await settleGenerationAtomic(env, {
+        licenseKey: license.key, jobId, attemptId: reservation.attemptId,
+        creditType: 'image', settlement: 'COMMIT', resultUrl: url,
+        metadata: { request_id: submitData.request_id, result_url: url },
+      });
+      if (!committed.ok) return err('Settlement quota belum selesai; coba polling ulang.', 503);
       return json({ type: 'url', url, provider: 'fal', engine: label });
     }
 
-    const taskId = encodeTaskId('image', modelCfg.id, submitData.request_id);
     return json({ pending: true, taskId, provider: 'fal' });
   } finally {
     await releaseLock(env, lockKey);
@@ -582,9 +659,6 @@ async function handleImageGenerate(request, env) {
 async function handleImageEdit(request, env) {
   const license = await getValidLicense(request, env);
   if (!license.ok) return err(license.error, license.status);
-  if (!hasCredit(license.entry, 'image')) {
-    return err('Kredit image habis bulan ini. Hubungi admin HC Labs untuk upgrade', 402);
-  }
 
   let body;
   try { body = await request.json(); } catch { return err('Body JSON tidak valid'); }
@@ -602,27 +676,103 @@ async function handleImageEdit(request, env) {
   try {
     const { modelCfg, usePremium } = decideEngine(license, 'i2i', ENGINES.imageEdit);
     const label = ENGINES.imageEdit.label;
+    const idempotencyKey = request.headers.get('Idempotency-Key') || crypto.randomUUID();
+    const jobId = crypto.randomUUID();
+    const estimatedCostUsd = ESTIMATED_COST_USD[modelCfg.id] ?? 0.25;
+    const reservation = await reserveGenerationAtomic(env, {
+      licenseKey: license.key,
+      idempotencyKey,
+      jobId,
+      flow: 'i2i',
+      provider: 'fal',
+      modelId: modelCfg.id,
+      creditType: 'image',
+      estimatedCostUsd,
+      maxActiveJobs: GENERATION_POLICY.maxActiveJobsPerLicense,
+      referenceCount: 1,
+      referenceStrategy: 'single-image',
+    });
+
+    if (reservation.duplicate) {
+      const existing = await getGenerationJob(env, reservation.jobId);
+      if (!existing) return err('Generation idempotency record tidak lengkap, coba lagi.', 409);
+      if (existing.status === 'COMPLETED' && existing.result_url) {
+        return json({ type: 'url', url: existing.result_url, provider: 'fal', engine: label, duplicate: true });
+      }
+      if (!existing.task_id) return err('Generation idempotency record belum memiliki task.', 409);
+      return json({ pending: true, taskId: existing.task_id, provider: 'fal', duplicate: true });
+    }
+    if (!reservation.ok) {
+      if (reservation.reason === 'ACTIVE_LIMIT') return err('Maksimal generation aktif tercapai. Tunggu job sebelumnya selesai.', 429);
+      if (reservation.reason === 'QUOTA_UNAVAILABLE') return err('Kredit image habis atau sedang dicadangkan oleh generation lain.', 402);
+      return err('Quota safety layer belum siap. Generation tidak dikirim ke provider.', 503);
+    }
 
     const spend = await checkAndRecordSpend(env, modelCfg.id);
-    if (!spend.allowed) return err('Batas biaya API harian tercapai. Coba lagi besok atau hubungi admin.', 503);
+    if (!spend.allowed) {
+      await settleGenerationAtomic(env, {
+        licenseKey: license.key, jobId, attemptId: reservation.attemptId,
+        creditType: 'image', settlement: 'RELEASE',
+        errorCode: 'COST_BUDGET_EXHAUSTED', errorMessage: 'Batas biaya API harian tercapai',
+      });
+      return err('Batas biaya API harian tercapai. Coba lagi besok atau hubungi admin.', 503);
+    }
 
     let submitData;
     try { submitData = await submitImageEdit(modelCfg, { prompt, image }, env); }
-    catch { return err('Layanan media gagal menerima permintaan edit', 502); }
+    catch {
+      await settleGenerationAtomic(env, {
+        licenseKey: license.key, jobId, attemptId: reservation.attemptId,
+        creditType: 'image', settlement: 'RELEASE',
+        errorCode: 'MEDIA_SUBMIT_FAILED', errorMessage: 'Layanan media gagal menerima permintaan edit',
+      });
+      return err('Layanan media gagal menerima permintaan edit. Kuota tidak dipotong.', 502);
+    }
     if (usePremium) await commitPremiumUsage(env, license, 'i2i');
+
+    const taskId = encodeTaskId('image', modelCfg.id, submitData.request_id, {
+      j: jobId, a: reservation.attemptId,
+    });
+    await updateGenerationJob(env, jobId, { status: 'SUBMITTED', requestId: submitData.request_id, taskId });
+    await updateGenerationAttempt(env, reservation.attemptId, { status: 'SUBMITTED', requestId: submitData.request_id });
+    await recordGenerationEvent(env, {
+      jobId, eventType: 'SUBMITTED', fromStatus: 'RESERVED', toStatus: 'SUBMITTED',
+      metadata: { request_id: submitData.request_id },
+    });
 
     const r = await pollFalSync(modelCfg.id, submitData.request_id, env);
 
-    if (r.state === 'error') return err('Layanan media gagal mengedit gambar', 502);
+    if (r.state === 'error') {
+      const settled = await settleGenerationAtomic(env, {
+        licenseKey: license.key, jobId, attemptId: reservation.attemptId,
+        creditType: 'image', settlement: 'RELEASE',
+        errorCode: 'MEDIA_ERROR', errorMessage: r.error,
+        metadata: { request_id: submitData.request_id },
+      });
+      if (!settled.ok) return err('Settlement quota belum selesai; coba polling ulang.', 503);
+      return err('Layanan media gagal mengedit gambar', 502);
+    }
 
     if (r.state === 'done') {
       const url = r.data.images?.[0]?.url || findUrl(r.data);
-      if (!url) return err('Tidak ada gambar hasil edit dari layanan media', 502);
-      await deductCredit(env, license.key, license.entry, 'image');
+      if (!url) {
+        const settled = await settleGenerationAtomic(env, {
+          licenseKey: license.key, jobId, attemptId: reservation.attemptId,
+          creditType: 'image', settlement: 'RELEASE', errorCode: 'NO_RESULT',
+          errorMessage: 'Tidak ada gambar hasil edit dari layanan media',
+        });
+        if (!settled.ok) return err('Settlement quota belum selesai; coba polling ulang.', 503);
+        return err('Tidak ada gambar hasil edit dari layanan media', 502);
+      }
+      const committed = await settleGenerationAtomic(env, {
+        licenseKey: license.key, jobId, attemptId: reservation.attemptId,
+        creditType: 'image', settlement: 'COMMIT', resultUrl: url,
+        metadata: { request_id: submitData.request_id, result_url: url },
+      });
+      if (!committed.ok) return err('Settlement quota belum selesai; coba polling ulang.', 503);
       return json({ type: 'url', url, provider: 'fal', engine: label });
     }
 
-    const taskId = encodeTaskId('image', modelCfg.id, submitData.request_id);
     return json({ pending: true, taskId, provider: 'fal' });
   } finally {
     await releaseLock(env, lockKey);

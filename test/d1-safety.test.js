@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   countActiveGenerationJobs,
   createGenerationAttempt,
+  getD1QuotaBalances,
   getIdempotencyRecord,
   recordGenerationEvent,
   recordValidationResult,
@@ -25,6 +26,7 @@ function fakeDb({ batchResults = [], existing = null } = {}) {
         },
         async run() { return { success: true, meta: { changes: 1 } }; },
         async first() { return existing; },
+        async all() { return { results: existing?.quotaBalances || [] }; },
       };
       prepared.push(statement);
       return statement;
@@ -65,6 +67,7 @@ test('reserveGenerationAtomic builds one D1 batch for reservation and job creati
   assert.match(db.prepared[1].sql, /available_units >= 1/);
   assert.match(db.prepared[1].sql, /COUNT\(\*\) FROM generation_jobs/);
   assert.match(db.prepared[1].sql, /< \?4/);
+  assert.match(db.prepared[0].sql, /CASE WHEN \?2 = 'image' THEN credits_image ELSE credits_video END/);
   assert.match(db.prepared[2].sql, /INSERT INTO generation_jobs/);
   assert.match(db.prepared[2].sql, /WHERE changes\(\) > 0/);
   assert.match(db.prepared[5].sql, /INSERT INTO quota_ledger/);
@@ -157,4 +160,19 @@ test('counts active jobs and updates provider attempt status', async () => {
   }), true);
   assert.match(db.prepared[0].sql, /COUNT\(\*\) AS active_jobs/);
   assert.match(db.prepared[1].sql, /UPDATE generation_attempts/);
+});
+
+test('reads current image and video quota balances from D1', async () => {
+  const db = fakeDb({ existing: {
+    quotaBalances: [
+      { credit_type: 'image', available_units: 4 },
+      { credit_type: 'video', available_units: 2 },
+    ],
+  } });
+  const balances = await getD1QuotaBalances({ HC_DB: db }, 'HC-001');
+  assert.deepEqual(balances, [
+    { credit_type: 'image', available_units: 4 },
+    { credit_type: 'video', available_units: 2 },
+  ]);
+  assert.match(db.prepared[0].sql, /FROM quota_balances/);
 });

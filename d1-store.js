@@ -59,6 +59,15 @@ export async function getD1License(env, key) {
   return result ? { key, entry: rowToLicenseEntry(result), source: 'd1' } : null;
 }
 
+export async function getD1QuotaBalances(env, key) {
+  if (!dbReady(env) || !key) return null;
+  const result = await env.HC_DB.prepare(`
+    SELECT credit_type, available_units, reserved_units, committed_units, released_units
+    FROM quota_balances WHERE license_key = ?1
+  `).bind(key).all();
+  return result?.results || [];
+}
+
 export async function upsertD1License(env, key, entry) {
   if (!dbReady(env)) return false;
   const r = licenseEntryToRow(key, entry);
@@ -201,7 +210,9 @@ export async function reserveGenerationAtomic(env, input) {
   const statements = [
     env.HC_DB.prepare(`
       INSERT OR IGNORE INTO quota_balances (license_key,credit_type,available_units)
-      SELECT license_key,?2,credits_video FROM licenses WHERE license_key = ?1
+      SELECT license_key,?2,
+             CASE WHEN ?2 = 'image' THEN credits_image ELSE credits_video END
+      FROM licenses WHERE license_key = ?1
     `).bind(input.licenseKey, creditType),
     env.HC_DB.prepare(`
       UPDATE quota_balances
