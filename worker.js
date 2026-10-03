@@ -44,7 +44,7 @@ const CORS = {
   'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-License-Key, X-License-Email, X-Admin-Secret, Idempotency-Key',
 };
 
-const BUILD_VERSION = 'phase-4-timeout-retry-policy-2026-10-03';
+const BUILD_VERSION = 'phase-4-audit-hardening-2026-10-04';
 
 const json = (data, status = 200) =>
   new Response(JSON.stringify(data), {
