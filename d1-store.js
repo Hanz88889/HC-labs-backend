@@ -83,22 +83,6 @@ export async function upsertD1License(env, key, entry) {
   return true;
 }
 
-export async function createGenerationJob(env, job) {
-  if (!dbReady(env)) return false;
-  await env.HC_DB.prepare(`
-    INSERT INTO generation_jobs (
-      job_id,license_key,flow,status,provider,model_id,request_id,task_id,
-      prompt_hash,duration_seconds,aspect_ratio,reference_count,reference_strategy
-    ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
-  `).bind(
-    job.jobId, job.licenseKey, job.flow, job.status || 'SUBMITTED', job.provider || null,
-    job.modelId || null, job.requestId || null, job.taskId || null, job.promptHash || null,
-    job.durationSeconds ?? null, job.aspectRatio || null, job.referenceCount || 0,
-    job.referenceStrategy || null,
-  ).run();
-  return true;
-}
-
 export async function updateGenerationJob(env, jobId, patch) {
   if (!dbReady(env) || !jobId) return false;
   const fields = [];

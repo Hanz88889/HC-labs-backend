@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildVideoInput, videoFramesForDuration } from '../fal-client.js';
+import { buildVideoInput, pollFalOnce, videoFramesForDuration } from '../fal-client.js';
 
 test('maps requested duration to Wan frame count', () => {
   assert.equal(videoFramesForDuration(5, 16), 81);
@@ -22,4 +22,19 @@ test('builds Wan payload with requested duration and ratio', () => {
     frames_per_second: 16,
     image_url: 'https://example.com/ref.png',
   });
+});
+
+test('treats terminal provider failure as error instead of indefinite pending', async () => {
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({ status: 'FAILED', error: 'provider failed' }), {
+    status: 200,
+    headers: { 'content-type': 'application/json' },
+  });
+  try {
+    const result = await pollFalOnce('fal-ai/wan-t2v', 'request-001', { FAL_KEY: 'test-key' });
+    assert.equal(result.state, 'error');
+    assert.match(result.error, /provider failed/);
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
 });

@@ -195,6 +195,9 @@ export async function pollFalOnce(modelId, requestId, env) {
   if (sdata.error) return { state: 'error', error: sdata.error };
 
   const status = (sdata.status || '').toUpperCase();
+  if (['FAILED', 'ERROR', 'CANCELLED', 'CANCELED', 'EXPIRED'].includes(status)) {
+    return { state: 'error', error: sdata.error || `Layanan media mengakhiri request dengan status ${status}` };
+  }
   if (status !== 'COMPLETED') return { state: 'pending' };
 
   const rres = await fetch(responseUrl, { headers: falHeaders(env) });

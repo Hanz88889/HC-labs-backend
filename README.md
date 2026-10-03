@@ -1,6 +1,6 @@
 # HC Labs Backend
 
-Cloudflare Worker backend untuk HC Labs. Worker utama berada di `worker.js` dan memakai `hc_kv` sebagai binding license/session/spend.
+Cloudflare Worker backend untuk HC Labs. Worker utama berada di `worker.js`. D1 `HC_DB` menjadi source of truth untuk license dan lifecycle generation; KV `hc_kv` dipertahankan untuk session Brain, spend guard, lock, serta fallback migrasi license.
 
 ## Struktur aktif
 
@@ -13,7 +13,10 @@ Cloudflare Worker backend untuk HC Labs. Worker utama berada di `worker.js` dan 
 | `koboi-client.js` | Adapter KoboiLLM OpenAI-compatible |
 | `zai-client.js` | Adapter Z.ai |
 | `test/` | Regression/unit tests |
-| `wrangler.toml` | Worker name, KV binding, dan deployment metadata |
+| `d1-store.js` | Adapter D1 untuk license, jobs, attempts, events, validation, quota, dan settlement |
+| `job-lifecycle.js` | State machine job/quota, timeout, dan retry policy |
+| `migrations/` | Migration D1 yang sudah diterapkan ke database production |
+| `wrangler.toml` | Worker name, KV/D1 binding, dan deployment metadata |
 
 Dokumentasi Prompt Compiler berada pada file `HC_LABS_*.md` dan merupakan spesifikasi/operasional, bukan runtime code.
 
@@ -29,4 +32,4 @@ npm test
 
 ## Deployment
 
-Repository ini terhubung ke Cloudflare Workers Builds pada branch `main`. Setelah push, cek GitHub Actions dan `GET /api/health`.
+Repository ini terhubung ke Cloudflare Workers Builds pada branch `main`. Setelah push, verifikasi build marker dan `GET /api/health` pada Worker production.

@@ -30,10 +30,10 @@ import {
 import { handleBrainRefine } from './brain-router.js';
 import { DEFAULT_BRAIN_MODEL } from './zai-client.js';
 import { providerConfig, selectedProvider } from './llm-router.js';
-import { elapsedSeconds, shouldExpireGeneration } from './job-lifecycle.js';
+import { GENERATION_POLICY, elapsedSeconds, shouldExpireGeneration } from './job-lifecycle.js';
 import {
   getD1License, upsertD1License, migrateKvLicense, d1Status,
-  createGenerationJob, updateGenerationJob, recordQuotaLedger,
+  updateGenerationJob, recordQuotaLedger,
   getGenerationJob, reserveGenerationAtomic, settleGenerationAtomic,
   recordGenerationEvent, updateGenerationAttempt,
 } from './d1-store.js';
@@ -164,7 +164,11 @@ async function getValidLicense(request, env) {
     return { ok: false, error: 'Kode tidak valid', status: 404 };
   }
 
-  const entry = d1License?.entry || JSON.parse(raw);
+  let entry = d1License?.entry;
+  if (!entry && raw) {
+    try { entry = JSON.parse(raw); }
+    catch { return { ok: false, error: 'Data lisensi rusak. Hubungi admin HC Labs', status: 503 }; }
+  }
   if (!d1License && raw) await migrateKvLicense(env, key, raw);
 
   if (entry.status === 'suspended') {
@@ -206,7 +210,11 @@ async function handleActivate(request, env) {
   const raw = d1License ? null : await env.hc_kv.get(key);
   if (!raw && !d1License) return err('Kode tidak valid', 404);
 
-  const entry = d1License?.entry || JSON.parse(raw);
+  let entry = d1License?.entry;
+  if (!entry && raw) {
+    try { entry = JSON.parse(raw); }
+    catch { return err('Data lisensi rusak. Hubungi admin HC Labs', 503); }
+  }
 
   if (entry.status === 'suspended') {
     return err('Akun di-suspend. Hubungi admin HC Labs', 403);
@@ -325,7 +333,11 @@ async function resolveFalTask(taskId, license, env) {
       metadata: { request_id: requestId },
     }).catch(() => ({ ok: false })) : { ok: false };
     if (!settled.ok) {
-      await updateGenerationJob(env, jobId, { status: 'FAILED', errorCode: 'MEDIA_ERROR', errorMessage: r.error });
+      return { result: {
+        status: 'settlement_pending', stage: 'settlement', elapsed_seconds: elapsed,
+        done: false, failed: false, url: null,
+        error: 'Settlement quota sedang dipulihkan; polling akan dilanjutkan.',
+      } };
     }
     return { result: { status: 'error', stage: 'failed', elapsed_seconds: elapsed, done: false, failed: true, url: null, error: r.error } };
   }
@@ -344,15 +356,11 @@ async function resolveFalTask(taskId, license, env) {
         metadata: { request_id: requestId, elapsed_seconds: elapsed },
       }).catch(() => ({ ok: false }));
       if (!expired.ok) {
-        await updateGenerationJob(env, jobId, {
-          status: 'EXPIRED', errorCode: 'TIMEOUT',
-          errorMessage: 'Generation melebihi batas waktu pemrosesan',
-        });
-        await updateGenerationAttempt(env, attemptId, {
-          status: 'EXPIRED', errorCode: 'TIMEOUT',
-          errorMessage: 'Generation melebihi batas waktu pemrosesan',
-          completedAt: new Date().toISOString(),
-        });
+        return { result: {
+          status: 'settlement_pending', stage: 'settlement', elapsed_seconds: elapsed,
+          done: false, failed: false, url: null,
+          error: 'Settlement timeout sedang dipulihkan; polling akan dilanjutkan.',
+        } };
       }
       return { result: {
         status: 'expired', stage: 'timeout', elapsed_seconds: elapsed,
@@ -387,7 +395,11 @@ async function resolveFalTask(taskId, license, env) {
       metadata: { request_id: requestId },
     }).catch(() => ({ ok: false })) : { ok: false };
     if (!settled.ok) {
-      await updateGenerationJob(env, jobId, { status: 'FAILED', errorCode: 'NO_RESULT', errorMessage: 'Tidak ada file hasil' });
+      return { result: {
+        status: 'settlement_pending', stage: 'settlement', elapsed_seconds: elapsed,
+        done: false, failed: false, url: null,
+        error: 'Settlement quota sedang dipulihkan; polling akan dilanjutkan.',
+      } };
     }
     return { result: { status: 'failed', stage: 'failed', elapsed_seconds: elapsed, done: false, failed: true, url: null, error: 'Tidak ada file hasil dari layanan media' } };
   }
@@ -403,6 +415,14 @@ async function resolveFalTask(taskId, license, env) {
   }).catch(() => ({ ok: false })) : { ok: false };
   if (committed.ok) {
     return { result: { status: 'completed', stage: 'completed', elapsed_seconds: elapsed, done: true, failed: false, url } };
+  }
+
+  if (jobId) {
+    return { result: {
+      status: 'settlement_pending', stage: 'settlement', elapsed_seconds: elapsed,
+      done: false, failed: false, url: null,
+      error: 'Settlement quota sedang dipulihkan; polling akan dilanjutkan.',
+    } };
   }
 
   const chargeFlagKey = `charged:${requestId}`;
@@ -532,11 +552,11 @@ async function handleImageGenerate(request, env) {
 
     const spend = await checkAndRecordSpend(env, modelCfg.id);
     if (!spend.allowed) return err('Batas biaya API harian tercapai. Coba lagi besok atau hubungi admin.', 503);
-    if (usePremium) await commitPremiumUsage(env, license, 't2i');
 
     let submitData;
     try { submitData = await submitImageGenerate(modelCfg, { prompt, size }, env); }
     catch { return err('Layanan media gagal menerima permintaan gambar', 502); }
+    if (usePremium) await commitPremiumUsage(env, license, 't2i');
 
     const r = await pollFalSync(modelCfg.id, submitData.request_id, env);
 
@@ -585,11 +605,11 @@ async function handleImageEdit(request, env) {
 
     const spend = await checkAndRecordSpend(env, modelCfg.id);
     if (!spend.allowed) return err('Batas biaya API harian tercapai. Coba lagi besok atau hubungi admin.', 503);
-    if (usePremium) await commitPremiumUsage(env, license, 'i2i');
 
     let submitData;
     try { submitData = await submitImageEdit(modelCfg, { prompt, image }, env); }
     catch { return err('Layanan media gagal menerima permintaan edit', 502); }
+    if (usePremium) await commitPremiumUsage(env, license, 'i2i');
 
     const r = await pollFalSync(modelCfg.id, submitData.request_id, env);
 
@@ -671,7 +691,7 @@ async function handleVideoGenerate(request, env) {
       referenceCount,
       referenceStrategy: reference_strategy,
       estimatedCostUsd,
-      maxActiveJobs: 2,
+      maxActiveJobs: GENERATION_POLICY.maxActiveJobsPerLicense,
       metadata: { flow: image ? 'i2v' : 't2v', reference_count: referenceCount },
     });
 
