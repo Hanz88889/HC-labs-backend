@@ -87,7 +87,7 @@ test('reserveGenerationAtomic returns the existing job for a duplicate idempoten
       { success: true, meta: { changes: 0 } },
       { success: true, meta: { changes: 0 } },
     ],
-    existing: { idempotency_key: 'req-dup', job_id: 'JOB-OLD', status: 'ACTIVE' },
+    existing: { idempotency_key: 'req-dup', license_key: 'HC-001', job_id: 'JOB-OLD', status: 'ACTIVE' },
   });
   const out = await reserveGenerationAtomic({ HC_DB: db }, {
     licenseKey: 'HC-001', idempotencyKey: 'req-dup', jobId: 'JOB-NEW', flow: 't2v',
