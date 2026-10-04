@@ -13,7 +13,7 @@
 // terbaik), sisanya otomatis pindah ke model BUDGET yang lebih murah.
 // User TIDAK melihat perbedaan apa pun — badge & history selalu menampilkan
 // nama brand yang sama (mis. "Aurum Vision"), baik lagi pakai premium
-// maupun budget. Threshold beda per tier (STD vs PRO) — lihat TAPER_THRESHOLD.
+// maupun budget. Threshold beda per tier (STD vs PRO) — lihat model-router.js.
 //
 // PENTING — belum ada di file ini: proses reset kredit bulanan (di luar
 // kode yang di-share ke Claude). Pastikan proses reset itu JUGA me-reset
@@ -34,6 +34,7 @@ import { GENERATION_POLICY, elapsedSeconds, shouldExpireGeneration, retryDecisio
 import { validateOutputContract, validateStoredAsset } from './output-validator.js';
 import { persistGeneratedAsset, getStoredAsset } from './asset-store.js';
 import { listCapabilities } from './capability-registry.js';
+import { selectModelForFlow } from './model-router.js';
 import {
   getD1License, getD1QuotaBalances, upsertD1License, migrateKvLicense, d1Status,
   updateGenerationJob,
@@ -64,13 +65,7 @@ const err = (msg, status = 400) => json({ error: msg }, status);
 // yang dapat model premium, sebelum otomatis pindah ke budget.
 // Ubah angka di sini kapan saja — tidak perlu ubah logika lain.
 // ─────────────────────────────────────────────
-const TAPER_THRESHOLD = { STD: 10, PRO: 30, STANDARD: 10 };
 const KV_MIN_EXPIRATION_TTL_SECONDS = 60;
-
-function taperThresholdFor(entry) {
-  const tier = (entry.tier || '').toUpperCase();
-  return TAPER_THRESHOLD[tier] ?? TAPER_THRESHOLD.STD;
-}
 
 // Tentukan engine premium/budget untuk satu flow ('t2i'|'i2i'|'t2v'|'i2v')
 // TANPA menulis apa pun — supaya bisa dicek dulu (kredit, circuit breaker)
@@ -78,13 +73,6 @@ function taperThresholdFor(entry) {
 // commitPremiumUsage (lihat di bawah) — kalau digabung, giliran circuit
 // breaker nolak permintaan, counter premium tetap naik padahal generate-nya
 // gak pernah kejadian. Itu bug yang sempat ada di versi sebelumnya.
-function decideEngine(license, flowKey, enginePair) {
-  const entry = license.entry;
-  const used = entry.premiumUsage?.[flowKey] ?? 0;
-  const threshold = taperThresholdFor(entry);
-  const usePremium = used < threshold;
-  return { modelCfg: usePremium ? enginePair.premium : enginePair.budget, usePremium };
-}
 
 // Baru nulis counter premiumUsage ke KV di sini — dipanggil HANYA setelah
 // semua pengecekan lain (kredit, circuit breaker) lolos.
@@ -769,7 +757,7 @@ async function handleImageGenerate(request, env) {
   }
 
   try {
-    const { modelCfg, usePremium } = decideEngine(license, 't2i', ENGINES.imageGenerate);
+    const { modelCfg, usePremium } = selectModelForFlow({ license, flow: 't2i', enginePair: ENGINES.imageGenerate });
     const label = ENGINES.imageGenerate.label;
     const idempotencyKey = request.headers.get('Idempotency-Key') || crypto.randomUUID();
     const jobId = crypto.randomUUID();
@@ -905,7 +893,7 @@ async function handleImageEdit(request, env) {
   }
 
   try {
-    const { modelCfg, usePremium } = decideEngine(license, 'i2i', ENGINES.imageEdit);
+    const { modelCfg, usePremium } = selectModelForFlow({ license, flow: 'i2i', enginePair: ENGINES.imageEdit });
     const label = ENGINES.imageEdit.label;
     const idempotencyKey = request.headers.get('Idempotency-Key') || crypto.randomUUID();
     const jobId = crypto.randomUUID();
@@ -1067,7 +1055,7 @@ async function handleVideoGenerate(request, env) {
 
   try {
     const enginePair = image ? ENGINES.videoI2V : ENGINES.videoT2V;
-    const { modelCfg, usePremium } = decideEngine(license, flowKey, enginePair);
+    const { modelCfg, usePremium } = selectModelForFlow({ license, flow: flowKey, enginePair });
     const jobId = crypto.randomUUID();
     const referenceCount = Number(reference_count) || (image ? 1 : 0);
     const estimatedCostUsd = ESTIMATED_COST_USD[modelCfg.id] ?? 0.25;
