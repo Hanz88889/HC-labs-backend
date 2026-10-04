@@ -359,7 +359,13 @@ export async function reserveGenerationAtomic(env, input) {
   const jobResult = results?.[2]?.meta || {};
   if (Number(reservationResult.changes || 0) !== 1 || Number(jobResult.changes || 0) !== 1) {
     const existing = await getIdempotencyRecord(env, idempotencyKey);
-    if (existing) return { ok: true, duplicate: true, jobId: existing.job_id, idempotencyKey };
+    if (existing) {
+      if (existing.license_key !== input.licenseKey) return { ok: false, reason: 'IDEMPOTENCY_KEY_CONFLICT' };
+      if (existing.request_hash && input.requestHash && existing.request_hash !== input.requestHash) {
+        return { ok: false, reason: 'IDEMPOTENCY_KEY_REUSED' };
+      }
+      return { ok: true, duplicate: true, jobId: existing.job_id, idempotencyKey };
+    }
     if (await countActiveGenerationJobs(env, input.licenseKey) >= maxActiveJobs) {
       return { ok: false, reason: 'ACTIVE_LIMIT' };
     }
@@ -453,6 +459,15 @@ export async function settleGenerationAtomic(env, input) {
         SELECT 1 FROM quota_balances
         WHERE license_key = ?2 AND credit_type = ?5 AND reserved_units >= 1
       )
+      AND EXISTS (
+        SELECT 1 FROM generation_jobs
+        WHERE job_id = ?3 AND license_key = ?2
+          AND status NOT IN ('COMPLETED','FAILED','EXPIRED','CANCELLED')
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM quota_ledger
+        WHERE job_id = ?3 AND event_type IN ('COMMIT','RELEASE')
+      )
     `).bind(
       ledgerId, input.licenseKey, jobId, settlement, creditType,
       input.actualCostUsd ?? input.estimatedCostUsd ?? 0, ledgerKey, metadataJson,
@@ -460,6 +475,7 @@ export async function settleGenerationAtomic(env, input) {
     env.HC_DB.prepare(`
       UPDATE quota_balances
       SET reserved_units = reserved_units - 1,
+          ${settlement === 'COMMIT' ? '' : 'available_units = available_units + 1,'}
           ${settlement === 'COMMIT' ? 'committed_units' : 'released_units'} =
             ${settlement === 'COMMIT' ? 'committed_units' : 'released_units'} + 1,
           updated_at = CURRENT_TIMESTAMP
@@ -570,4 +586,62 @@ export async function listPersistedModels(env) {
     SELECT model_key,provider,model_id,label,active FROM model_registry ORDER BY model_key
   `).all();
   return result?.results || [];
+}
+
+export async function getLatestGenerationAttempt(env, jobId) {
+  if (!dbReady(env) || !jobId) return null;
+  return env.HC_DB.prepare(`
+    SELECT attempt_id,job_id,attempt_no,status,provider,model_id,request_id,
+           error_code,error_message,estimated_cost_usd,actual_cost_usd,created_at,completed_at
+    FROM generation_attempts WHERE job_id = ?1
+    ORDER BY attempt_no DESC, created_at DESC LIMIT 1
+  `).bind(jobId).first();
+}
+
+export async function countGenerationAttempts(env, jobId) {
+  if (!dbReady(env) || !jobId) return 0;
+  const row = await env.HC_DB.prepare(
+    'SELECT COUNT(*) AS attempts FROM generation_attempts WHERE job_id = ?1',
+  ).bind(jobId).first();
+  return Number(row?.attempts || 0);
+}
+
+export async function listStaleActiveJobs(env, olderThanSeconds, limit = 25) {
+  if (!dbReady(env)) return [];
+  const seconds = Math.max(60, Math.floor(Number(olderThanSeconds) || 900));
+  const result = await env.HC_DB.prepare(`
+    SELECT job_id, license_key, flow, status FROM generation_jobs
+    WHERE status IN ('RESERVED','PLANNED','ROUTING','SUBMITTING','SUBMITTED',
+                     'QUEUED','PROCESSING','DOWNLOADING','VALIDATING_OUTPUT',
+                     'CONTENT_VALIDATION','REFINING','RETRY')
+      AND created_at <= datetime('now', ?1)
+    ORDER BY created_at ASC LIMIT ?2
+  `).bind(`-${seconds} seconds`, Math.max(1, Math.min(100, Number(limit) || 25))).all();
+  return result?.results || [];
+}
+
+export async function expireStaleGenerations(env, options = {}) {
+  if (!dbReady(env)) return { scanned: 0, released: 0, failed: 0 };
+  const stale = await listStaleActiveJobs(env, options.olderThanSeconds, options.limit);
+  let released = 0;
+  let failed = 0;
+  for (const job of stale) {
+    const attempt = await getLatestGenerationAttempt(env, job.job_id).catch(() => null);
+    const outcome = await settleGenerationAtomic(env, {
+      licenseKey: job.license_key,
+      jobId: job.job_id,
+      attemptId: attempt?.attempt_id || null,
+      creditType: job.flow === 't2i' || job.flow === 'i2i' ? 'image' : 'video',
+      settlement: 'RELEASE',
+      terminalStatus: 'EXPIRED',
+      attemptStatus: 'EXPIRED',
+      fromStatus: job.status,
+      errorCode: 'REAPED_TIMEOUT',
+      errorMessage: 'Generation dihentikan otomatis karena melewati batas waktu',
+    }).catch(() => ({ ok: false }));
+    if (outcome.ok) released++; else failed++;
+  }
+  await env.HC_DB.prepare('DELETE FROM operation_locks WHERE expires_at_epoch <= ?1')
+    .bind(Math.floor(Date.now() / 1000)).run().catch(() => null);
+  return { scanned: stale.length, released, failed };
 }

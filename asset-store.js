@@ -29,7 +29,7 @@ export async function persistGeneratedAsset(env, { flow, jobId, attemptId, sourc
   const advertisedBytes = Number(response.headers.get('content-length') || 0);
   if (advertisedBytes > MAX_ASSET_BYTES) return { ok: false, reason: 'SOURCE_ASSET_TOO_LARGE' };
 
-  const key = `assets/${jobId}/${attemptId}.${extensionFor(contentType, expectedType)}`;
+  const key = `generated/${jobId}/${attemptId}.${extensionFor(contentType, expectedType)}`;
   const { readable, writable } = new TransformStream();
   const reader = response.body.getReader();
   const writer = writable.getWriter();
@@ -52,7 +52,7 @@ export async function persistGeneratedAsset(env, { flow, jobId, attemptId, sourc
 
   try {
     const upload = env.HC_ASSETS.put(key, readable, {
-      httpMetadata: { contentType, cacheControl: 'public, max-age=31536000, immutable' },
+      httpMetadata: { contentType, cacheControl: 'public, max-age=86400' },
       customMetadata: { job_id: jobId, attempt_id: attemptId, flow },
     });
     await pump;
@@ -71,6 +71,6 @@ export async function persistGeneratedAsset(env, { flow, jobId, attemptId, sourc
 }
 
 export async function getStoredAsset(env, key) {
-  if (!env.HC_ASSETS || !key || key.includes('..')) return null;
+  if (!env.HC_ASSETS || !key || key.includes('..') || !key.startsWith('generated/')) return null;
   return env.HC_ASSETS.get(key);
 }

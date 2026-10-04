@@ -28,6 +28,9 @@ migrations_dir = "migrations"
 binding = "HC_ASSETS"
 bucket_name = "hc-labs-assets"
 
+[triggers]
+crons = ["*/10 * * * *"]
+
 # ─────────────────────────────────────────────
 # SECRETS — JANGAN pernah ditaruh di file ini (file ini masuk ke Git).
 # Set lewat salah satu cara berikut setelah repo ter-connect:

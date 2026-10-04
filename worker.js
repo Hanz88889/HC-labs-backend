@@ -42,6 +42,7 @@ import {
   reserveGenerationAtomic, settleGenerationAtomic,
   recordGenerationEvent, updateGenerationAttempt, acquireOperationLock,
   releaseOperationLock, reserveDailySpendAtomic, recordValidationResult, recordGenerationAsset,
+  getLatestGenerationAttempt, countGenerationAttempts, expireStaleGenerations,
 } from './d1-store.js';
 
 const CORS = {
@@ -149,6 +150,12 @@ async function releaseLock(env, lockKey, token) {
   if (token) await env.hc_kv.delete(lockKey);
 }
 
+
+async function requestFingerprint(payload) {
+  const bytes = new TextEncoder().encode(JSON.stringify(payload));
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, '0')).join('');
+}
 
 function getLicenseHeaders(request) {
   const key = request.headers.get('X-License-Key');
@@ -414,6 +421,21 @@ async function retryProviderAttempt(env, job, previousAttempt, failureCode) {
   const decision = retryDecision({ failureCode, attemptNo: previousAttempt.attempt_no });
   if (!decision.allowed) return null;
 
+  const retryLockKey = `retry:${job.job_id}`;
+  const retryLockToken = await acquireLock(env, retryLockKey, 60);
+  const concurrentResult = { taskId: job.task_id, attemptId: previousAttempt.attempt_id, attemptNo: previousAttempt.attempt_no, concurrent: true };
+  if (!retryLockToken) return concurrentResult;
+  try {
+    const latest = await getLatestGenerationAttempt(env, job.job_id);
+    if (latest && latest.attempt_id !== previousAttempt.attempt_id) return concurrentResult;
+    if (await countGenerationAttempts(env, job.job_id) >= GENERATION_POLICY.maxProviderAttempts) return null;
+    return await runRetryAttempt(env, job, previousAttempt, failureCode, decision);
+  } finally {
+    await releaseLock(env, retryLockKey, retryLockToken);
+  }
+}
+
+async function runRetryAttempt(env, job, previousAttempt, failureCode, decision) {
   const raw = await env.hc_kv.get(retryInputKey(job.job_id));
   if (!raw) return null;
   let input;
@@ -484,10 +506,35 @@ async function resolveFalTask(taskId, license, env) {
   const decoded = decodeTaskId(taskId);
   if (!decoded) return { error: 'taskId tidak valid', status: 400 };
 
-  const { t: creditType, m: modelId, r: requestId, j: jobId, a: attemptId } = decoded;
-  const job = jobId ? await getGenerationJob(env, jobId).catch(() => null) : null;
-  const attempt = attemptId ? await getGenerationAttempt(env, attemptId).catch(() => null) : null;
-  const elapsed = elapsedSeconds(job?.created_at);
+  const jobId = typeof decoded.j === 'string' ? decoded.j : null;
+  if (!jobId) {
+    return { result: {
+      status: 'legacy_task_unsupported', stage: 'migration', done: false, failed: true, url: null,
+      error: 'Task lama tanpa metadata D1 tidak dapat diselesaikan; kirim generation baru.',
+    } };
+  }
+  const job = await getGenerationJob(env, jobId).catch(() => null);
+  if (!job || job.license_key !== license.key) return { error: 'Task tidak ditemukan', status: 404 };
+  const elapsed = elapsedSeconds(job.created_at);
+  if (job.status === 'COMPLETED' && job.result_url) {
+    return { result: { status: 'completed', stage: 'completed', elapsed_seconds: elapsed, done: true, failed: false, url: job.result_url } };
+  }
+  if (['FAILED', 'EXPIRED', 'CANCELLED'].includes(job.status)) {
+    return { result: {
+      status: job.status === 'EXPIRED' ? 'expired' : 'failed',
+      stage: job.status === 'EXPIRED' ? 'timeout' : 'failed',
+      elapsed_seconds: elapsed, done: false, failed: true, url: null,
+      error: job.error_message || 'Generation tidak berhasil',
+    } };
+  }
+  const attempt = await getLatestGenerationAttempt(env, jobId).catch(() => null);
+  const attemptId = attempt?.attempt_id || null;
+  const creditType = job.flow === 't2i' || job.flow === 'i2i' ? 'image' : 'video';
+  const modelId = job.model_id;
+  const requestId = job.request_id;
+  if (!modelId || !requestId) {
+    return { result: { status: 'in_progress', stage: 'preparing', elapsed_seconds: elapsed, done: false, failed: false, url: null } };
+  }
   let retryInput = null;
   try {
     const rawInput = jobId ? await env.hc_kv.get(retryInputKey(jobId)) : null;
@@ -772,6 +819,7 @@ async function handleImageGenerate(request, env) {
       creditType: 'image',
       estimatedCostUsd,
       maxActiveJobs: GENERATION_POLICY.maxActiveJobsPerLicense,
+      requestHash: await requestFingerprint({ flow: 't2i', prompt, size }),
     });
 
     if (reservation.duplicate) {
@@ -784,6 +832,9 @@ async function handleImageGenerate(request, env) {
       return json({ pending: true, taskId: existing.task_id, provider: 'fal', duplicate: true });
     }
     if (!reservation.ok) {
+      if (reservation.reason === 'IDEMPOTENCY_KEY_REUSED' || reservation.reason === 'IDEMPOTENCY_KEY_CONFLICT') {
+        return err('Idempotency-Key sudah dipakai untuk permintaan lain.', 409);
+      }
       if (reservation.reason === 'ACTIVE_LIMIT') return err('Maksimal generation aktif tercapai. Tunggu job sebelumnya selesai.', 429);
       if (reservation.reason === 'QUOTA_UNAVAILABLE') return err('Kredit image habis atau sedang dicadangkan oleh generation lain.', 402);
       return err('Quota safety layer belum siap. Generation tidak dikirim ke provider.', 503);
@@ -910,6 +961,7 @@ async function handleImageEdit(request, env) {
       maxActiveJobs: GENERATION_POLICY.maxActiveJobsPerLicense,
       referenceCount: 1,
       referenceStrategy: 'single-image',
+      requestHash: await requestFingerprint({ flow: 'i2i', prompt, image }),
     });
 
     if (reservation.duplicate) {
@@ -922,6 +974,9 @@ async function handleImageEdit(request, env) {
       return json({ pending: true, taskId: existing.task_id, provider: 'fal', duplicate: true });
     }
     if (!reservation.ok) {
+      if (reservation.reason === 'IDEMPOTENCY_KEY_REUSED' || reservation.reason === 'IDEMPOTENCY_KEY_CONFLICT') {
+        return err('Idempotency-Key sudah dipakai untuk permintaan lain.', 409);
+      }
       if (reservation.reason === 'ACTIVE_LIMIT') return err('Maksimal generation aktif tercapai. Tunggu job sebelumnya selesai.', 429);
       if (reservation.reason === 'QUOTA_UNAVAILABLE') return err('Kredit image habis atau sedang dicadangkan oleh generation lain.', 402);
       return err('Quota safety layer belum siap. Generation tidak dikirim ke provider.', 503);
@@ -1074,6 +1129,9 @@ async function handleVideoGenerate(request, env) {
       estimatedCostUsd,
       maxActiveJobs: GENERATION_POLICY.maxActiveJobsPerLicense,
       metadata: { flow: image ? 'i2v' : 't2v', reference_count: referenceCount },
+      requestHash: await requestFingerprint({
+        flow: flowKey, prompt, ratio, durationSeconds, image: image || null, referenceCount, reference_strategy,
+      }),
     });
 
     if (reservation.duplicate) {
@@ -1089,6 +1147,9 @@ async function handleVideoGenerate(request, env) {
       });
     }
     if (!reservation.ok) {
+      if (reservation.reason === 'IDEMPOTENCY_KEY_REUSED' || reservation.reason === 'IDEMPOTENCY_KEY_CONFLICT') {
+        return err('Idempotency-Key sudah dipakai untuk permintaan lain.', 409);
+      }
       if (reservation.reason === 'ACTIVE_LIMIT') {
         return err('Maksimal 2 video generation aktif per license. Tunggu job sebelumnya selesai.', 429);
       }
@@ -1166,6 +1227,8 @@ async function handleVideoPoll(request, env, parts) {
 // POST /api/diagnostics
 // ─────────────────────────────────────────────
 async function handleDiagnostics(request, env) {
+  const license = await getValidLicense(request, env);
+  if (!license.ok) return err(license.error, license.status);
   const results = [];
 
   results.push({
@@ -1221,7 +1284,7 @@ async function handleStoredAsset(env, encodedKey) {
   if (!object) return err('Asset tidak ditemukan', 404);
   const headers = {
     ...CORS,
-    'Cache-Control': 'public, max-age=31536000, immutable',
+    'Cache-Control': 'public, max-age=86400',
     'Content-Type': object.httpMetadata?.contentType || 'application/octet-stream',
   };
   if (object.httpEtag) headers.ETag = object.httpEtag;
@@ -1232,6 +1295,9 @@ async function handleStoredAsset(env, encodedKey) {
 // MAIN ROUTER
 // ─────────────────────────────────────────────
 export default {
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(expireStaleGenerations(env, { olderThanSeconds: 900, limit: 50 }));
+  },
   async fetch(request, env) {
     if (request.method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: CORS });
