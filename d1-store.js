@@ -140,6 +140,69 @@ export function d1Status(env) {
   return { configured: dbReady(env), binding: 'HC_DB' };
 }
 
+export async function acquireOperationLock(env, lockKey, ttlSeconds = 60) {
+  if (!dbReady(env) || !lockKey) return null;
+  const token = crypto.randomUUID();
+  const expiresAt = Math.floor(Date.now() / 1000) + Math.max(60, Number(ttlSeconds) || 60);
+  const results = await env.HC_DB.batch([
+    env.HC_DB.prepare('DELETE FROM operation_locks WHERE lock_key = ?1 AND expires_at_epoch <= ?2').bind(lockKey, Math.floor(Date.now() / 1000)),
+    env.HC_DB.prepare(`
+      INSERT OR IGNORE INTO operation_locks (lock_key, token, expires_at_epoch)
+      VALUES (?1, ?2, ?3)
+    `).bind(lockKey, token, expiresAt),
+  ]);
+  return Number(results?.[1]?.meta?.changes || 0) === 1 ? token : null;
+}
+
+export async function releaseOperationLock(env, lockKey, token) {
+  if (!dbReady(env) || !lockKey || !token) return false;
+  const result = await env.HC_DB.prepare(
+    'DELETE FROM operation_locks WHERE lock_key = ?1 AND token = ?2',
+  ).bind(lockKey, token).run();
+  return Number(result?.meta?.changes || 0) === 1;
+}
+
+export async function reserveDailySpendAtomic(env, input) {
+  if (!dbReady(env)) return { ok: false, reason: 'D1_UNAVAILABLE' };
+  const dayKey = input.dayKey;
+  const reservationId = input.reservationId;
+  const amountUsd = Number(input.amountUsd || 0);
+  const capUsd = Number(input.capUsd || 0);
+  if (!dayKey || !reservationId || !(amountUsd > 0) || !(capUsd > 0)) {
+    return { ok: false, reason: 'INVALID_SPEND_INPUT' };
+  }
+
+  const results = await env.HC_DB.batch([
+    env.HC_DB.prepare(`
+      INSERT OR IGNORE INTO spend_counters (day_key, spent_usd, cap_usd)
+      VALUES (?1, 0, ?2)
+    `).bind(dayKey, capUsd),
+    env.HC_DB.prepare(`
+      INSERT OR IGNORE INTO spend_reservations (reservation_id, day_key, amount_usd)
+      SELECT ?1, ?2, ?3
+      WHERE EXISTS (
+        SELECT 1 FROM spend_counters
+        WHERE day_key = ?2 AND spent_usd + ?3 <= cap_usd
+      )
+    `).bind(reservationId, dayKey, amountUsd),
+    env.HC_DB.prepare(`
+      UPDATE spend_counters
+      SET spent_usd = spent_usd + ?1, updated_at = CURRENT_TIMESTAMP
+      WHERE day_key = ?2 AND changes() = 1
+    `).bind(amountUsd, dayKey),
+  ]);
+
+  if (Number(results?.[2]?.meta?.changes || 0) === 1) {
+    return { ok: true, duplicate: false, dayKey, reservationId, amountUsd };
+  }
+
+  const existing = await env.HC_DB.prepare(
+    'SELECT reservation_id, amount_usd FROM spend_reservations WHERE reservation_id = ?1',
+  ).bind(reservationId).first();
+  if (existing) return { ok: true, duplicate: true, dayKey, reservationId, amountUsd: Number(existing.amount_usd) };
+  return { ok: false, reason: 'SPEND_CAP_EXCEEDED' };
+}
+
 export async function getIdempotencyRecord(env, key) {
   if (!dbReady(env)) return null;
   const normalized = normalizeIdempotencyKey(key);
@@ -192,6 +255,19 @@ export async function recordValidationResult(env, result) {
     result.validationId || crypto.randomUUID(), result.jobId, result.attemptId || null,
     result.validationType, result.status, result.failureCode || null,
     result.details ? JSON.stringify(result.details) : null,
+  ).run();
+  return true;
+}
+
+export async function recordGenerationAsset(env, asset) {
+  if (!dbReady(env)) return false;
+  await env.HC_DB.prepare(`
+    INSERT OR IGNORE INTO generation_assets
+      (asset_id,job_id,attempt_id,storage_key,content_type,byte_size)
+    VALUES (?1,?2,?3,?4,?5,?6)
+  `).bind(
+    asset.assetId || crypto.randomUUID(), asset.jobId, asset.attemptId || null,
+    asset.storageKey, asset.contentType, Number(asset.byteSize || 0),
   ).run();
   return true;
 }
@@ -300,6 +376,15 @@ export async function getGenerationJob(env, jobId) {
            reference_count,reference_strategy,created_at,updated_at,completed_at
     FROM generation_jobs WHERE job_id = ?1
   `).bind(jobId).first();
+}
+
+export async function getGenerationAttempt(env, attemptId) {
+  if (!dbReady(env) || !attemptId) return null;
+  return env.HC_DB.prepare(`
+    SELECT attempt_id,job_id,attempt_no,status,provider,model_id,request_id,
+           error_code,error_message,estimated_cost_usd,actual_cost_usd,created_at,completed_at
+    FROM generation_attempts WHERE attempt_id = ?1
+  `).bind(attemptId).first();
 }
 
 export async function countActiveGenerationJobs(env, licenseKey) {

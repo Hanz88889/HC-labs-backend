@@ -24,6 +24,10 @@ database_name = "hclabs-core"
 database_id = "8f10f3a1-0542-4b4b-a68a-57ad66cadc7a"
 migrations_dir = "migrations"
 
+[[r2_buckets]]
+binding = "HC_ASSETS"
+bucket_name = "hc-labs-assets"
+
 # ─────────────────────────────────────────────
 # SECRETS — JANGAN pernah ditaruh di file ini (file ini masuk ke Git).
 # Set lewat salah satu cara berikut setelah repo ter-connect:

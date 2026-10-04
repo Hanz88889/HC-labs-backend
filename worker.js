@@ -30,12 +30,16 @@ import {
 import { handleBrainRefine } from './brain-router.js';
 import { DEFAULT_BRAIN_MODEL } from './zai-client.js';
 import { providerConfig, selectedProvider } from './llm-router.js';
-import { GENERATION_POLICY, elapsedSeconds, shouldExpireGeneration } from './job-lifecycle.js';
+import { GENERATION_POLICY, elapsedSeconds, shouldExpireGeneration, retryDecision } from './job-lifecycle.js';
+import { validateOutputContract, validateStoredAsset } from './output-validator.js';
+import { persistGeneratedAsset, getStoredAsset } from './asset-store.js';
 import {
   getD1License, getD1QuotaBalances, upsertD1License, migrateKvLicense, d1Status,
-  updateGenerationJob, recordQuotaLedger,
-  getGenerationJob, reserveGenerationAtomic, settleGenerationAtomic,
-  recordGenerationEvent, updateGenerationAttempt,
+  updateGenerationJob,
+  getGenerationJob, getGenerationAttempt, createGenerationAttempt,
+  reserveGenerationAtomic, settleGenerationAtomic,
+  recordGenerationEvent, updateGenerationAttempt, acquireOperationLock,
+  releaseOperationLock, reserveDailySpendAtomic, recordValidationResult, recordGenerationAsset,
 } from './d1-store.js';
 
 const CORS = {
@@ -44,7 +48,7 @@ const CORS = {
   'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-License-Key, X-License-Email, X-Admin-Secret, Idempotency-Key',
 };
 
-const BUILD_VERSION = 'phase-5-image-d1-2026-10-04';
+const BUILD_VERSION = 'phase-6-gap-closure-2026-10-04';
 
 const json = (data, status = 200) =>
   new Response(JSON.stringify(data), {
@@ -115,9 +119,15 @@ const ESTIMATED_COST_USD = {
   'gpt-6-astra': 0.20,
 };
 
-async function checkAndRecordSpend(env, modelId) {
+async function checkAndRecordSpend(env, modelId, reservationId = crypto.randomUUID()) {
   const cost = ESTIMATED_COST_USD[modelId] ?? 0.25; // model gak dikenal = asumsi mahal, aman
   const dayKey = `spend:${new Date().toISOString().slice(0, 10)}`;
+  if (env.HC_DB) {
+    const result = await reserveDailySpendAtomic(env, {
+      dayKey, reservationId, amountUsd: cost, capUsd: DAILY_SPEND_CAP_USD,
+    });
+    return { ...result, allowed: result.ok };
+  }
   const raw = await env.hc_kv.get(dayKey);
   const current = raw ? parseFloat(raw) : 0;
   if (current + cost > DAILY_SPEND_CAP_USD) {
@@ -134,15 +144,20 @@ async function checkAndRecordSpend(env, modelId) {
 // pengaman kalau proses gagal ditengah jalan tanpa sempat release lock.
 // ─────────────────────────────────────────────
 async function acquireLock(env, lockKey, ttlSeconds) {
+  if (env.HC_DB) return acquireOperationLock(env, lockKey, ttlSeconds);
   const existing = await env.hc_kv.get(lockKey);
   if (existing) return false;
   const safeTtl = Math.max(KV_MIN_EXPIRATION_TTL_SECONDS, Number(ttlSeconds) || KV_MIN_EXPIRATION_TTL_SECONDS);
   await env.hc_kv.put(lockKey, '1', { expirationTtl: safeTtl });
-  return true;
+  return 'kv-lock';
 }
 
-async function releaseLock(env, lockKey) {
-  await env.hc_kv.delete(lockKey);
+async function releaseLock(env, lockKey, token) {
+  if (env.HC_DB) {
+    await releaseOperationLock(env, lockKey, token);
+    return;
+  }
+  if (token) await env.hc_kv.delete(lockKey);
 }
 
 
@@ -184,12 +199,6 @@ async function getValidLicense(request, env) {
   }
 
   return { ok: true, key, entry, source: d1License ? 'd1' : 'kv' };
-}
-
-async function deductCredit(env, key, entry, type) {
-  entry.credits[type] = Math.max(0, (entry.credits[type] ?? 0) - 1);
-  await env.hc_kv.put(key, JSON.stringify(entry));
-  await upsertD1License(env, key, entry);
 }
 
 // ─────────────────────────────────────────────
@@ -316,6 +325,170 @@ async function handleD1Migration(request, env) {
   return json({ ok: true, scanned, migrated, d1: d1Status(env) });
 }
 
+async function validateAndRetainOutput(env, { job, attemptId, url, providerData, prompt, durationSeconds }) {
+  if (!env.HC_DB || !env.HC_ASSETS) return { ok: false, reason: 'VALIDATION_STORAGE_UNAVAILABLE' };
+  const content = validateOutputContract({
+    flow: job.flow, url, providerData, prompt, durationSeconds,
+  });
+  await recordValidationResult(env, {
+    jobId: job.job_id, attemptId, validationType: content.validationType,
+    status: content.status, failureCode: content.failureCode, details: content.details,
+  });
+  if (content.status !== 'PASS') return { ok: false, reason: content.failureCode || 'CONTENT_VALIDATION_FAILED' };
+
+  const retained = await persistGeneratedAsset(env, {
+    flow: job.flow, jobId: job.job_id, attemptId, sourceUrl: url,
+  });
+  if (!retained.ok) {
+    await recordValidationResult(env, {
+      jobId: job.job_id, attemptId, validationType: 'technical', status: 'FAIL',
+      failureCode: retained.reason, details: retained,
+    });
+    return { ok: false, reason: retained.reason };
+  }
+  const technical = validateStoredAsset({
+    contentType: retained.contentType,
+    expectedKind: job.flow === 't2i' || job.flow === 'i2i' ? 'image' : 'video',
+    bytes: retained.bytes,
+  });
+  await recordValidationResult(env, {
+    jobId: job.job_id, attemptId, validationType: technical.validationType,
+    status: technical.status, failureCode: technical.failureCode, details: technical.details,
+  });
+  if (technical.status !== 'PASS') {
+    await env.HC_ASSETS.delete(retained.key);
+    return { ok: false, reason: technical.failureCode || 'TECHNICAL_VALIDATION_FAILED' };
+  }
+  try {
+    await recordGenerationAsset(env, {
+      jobId: job.job_id, attemptId, storageKey: retained.key,
+      contentType: retained.contentType, byteSize: retained.bytes,
+    });
+  } catch {
+    await env.HC_ASSETS.delete(retained.key);
+    return { ok: false, reason: 'ASSET_METADATA_FAILED' };
+  }
+  return { ok: true, internalUrl: retained.internalUrl };
+}
+
+async function finalizeSynchronousOutput(env, input) {
+  const job = await getGenerationJob(env, input.jobId).catch(() => null);
+  const retained = await validateAndRetainOutput(env, {
+    job, attemptId: input.attemptId, url: input.url, providerData: input.providerData,
+    prompt: input.prompt, durationSeconds: input.durationSeconds,
+  }).catch(() => ({ ok: false, reason: 'VALIDATION_FAILED' }));
+  if (!retained.ok) {
+    const released = await settleGenerationAtomic(env, {
+      licenseKey: input.licenseKey, jobId: input.jobId, attemptId: input.attemptId,
+      creditType: input.creditType, settlement: 'RELEASE',
+      errorCode: retained.reason, errorMessage: 'Output gagal melewati validation atau retention gate',
+    }).catch(() => ({ ok: false }));
+    return { ok: false, reason: released.ok ? retained.reason : 'SETTLEMENT_PENDING' };
+  }
+  const committed = await settleGenerationAtomic(env, {
+    licenseKey: input.licenseKey, jobId: input.jobId, attemptId: input.attemptId,
+    creditType: input.creditType, settlement: 'COMMIT', resultUrl: retained.internalUrl,
+    metadata: { request_id: input.requestId, result_url: retained.internalUrl },
+  }).catch(() => ({ ok: false }));
+  if (!committed.ok) return { ok: false, reason: 'SETTLEMENT_PENDING' };
+  await clearRetryInput(env, input.jobId);
+  return { ok: true, url: retained.internalUrl, duplicate: committed.duplicate === true };
+}
+
+function retryInputKey(jobId) {
+  return `retry-input:${jobId}`;
+}
+
+async function rememberRetryInput(env, jobId, payload) {
+  await env.hc_kv.put(retryInputKey(jobId), JSON.stringify(payload), { expirationTtl: 86400 });
+}
+
+async function clearRetryInput(env, jobId) {
+  if (jobId) await env.hc_kv.delete(retryInputKey(jobId));
+}
+
+function modelConfigForJob(job) {
+  const registry = job.flow === 't2i' ? ENGINES.imageGenerate
+    : job.flow === 'i2i' ? ENGINES.imageEdit
+      : job.flow === 'i2v' ? ENGINES.videoI2V : ENGINES.videoT2V;
+  const configured = [registry.premium, registry.budget].find((item) => item.id === job.model_id);
+  if (configured) return configured;
+  return job.flow === 'i2i'
+    ? { id: job.model_id, imageField: 'image_url' }
+    : job.flow === 'i2v' || job.flow === 't2v'
+      ? { id: job.model_id, family: 'wan' }
+      : { id: job.model_id, sizing: 'flux' };
+}
+
+async function retryProviderAttempt(env, job, previousAttempt, failureCode) {
+  if (!job?.job_id || !previousAttempt) return null;
+  const decision = retryDecision({ failureCode, attemptNo: previousAttempt.attempt_no });
+  if (!decision.allowed) return null;
+
+  const raw = await env.hc_kv.get(retryInputKey(job.job_id));
+  if (!raw) return null;
+  let input;
+  try { input = JSON.parse(raw); } catch { return null; }
+
+  const spend = await checkAndRecordSpend(env, job.model_id, `retry:${job.job_id}:${decision.nextAttemptNo}`);
+  if (!spend.allowed) return null;
+
+  await updateGenerationAttempt(env, previousAttempt.attempt_id, {
+    status: 'FAILED', errorCode: failureCode,
+    errorMessage: `Retrying provider attempt ${decision.nextAttemptNo}`,
+    completedAt: new Date().toISOString(),
+  });
+  await updateGenerationJob(env, job.job_id, { status: 'RETRY' });
+  await recordGenerationEvent(env, {
+    jobId: job.job_id, eventType: 'RETRY', fromStatus: job.status, toStatus: 'RETRY',
+    metadata: { failure_code: failureCode, next_attempt_no: decision.nextAttemptNo },
+  });
+
+  const nextAttemptId = crypto.randomUUID();
+  await createGenerationAttempt(env, {
+    attemptId: nextAttemptId, jobId: job.job_id, attemptNo: decision.nextAttemptNo,
+    status: 'CREATED', provider: job.provider, modelId: job.model_id,
+    estimatedCostUsd: ESTIMATED_COST_USD[job.model_id] ?? 0.25,
+    metadata: { retry_of: previousAttempt.attempt_id, failure_code: failureCode },
+  });
+
+  let submitData;
+  try {
+    const modelCfg = modelConfigForJob(job);
+    if (job.flow === 't2i') {
+      submitData = await submitImageGenerate(modelCfg, { prompt: input.prompt, size: input.size }, env);
+    } else if (job.flow === 'i2i') {
+      submitData = await submitImageEdit(modelCfg, { prompt: input.prompt, image: input.image }, env);
+    } else {
+      submitData = await submitVideo(modelCfg, {
+        prompt: input.prompt, image: input.image, ratio: input.ratio, duration: input.duration,
+      }, env);
+    }
+  } catch (error) {
+    await updateGenerationAttempt(env, nextAttemptId, {
+      status: 'FAILED', errorCode: 'MEDIA_SUBMIT_FAILED', errorMessage: error.message,
+      completedAt: new Date().toISOString(),
+    });
+    return null;
+  }
+
+  const taskId = encodeTaskId(
+    job.flow === 't2i' || job.flow === 'i2i' ? 'image' : 'video',
+    job.model_id, submitData.request_id, { j: job.job_id, a: nextAttemptId },
+  );
+  await updateGenerationJob(env, job.job_id, {
+    status: 'SUBMITTED', requestId: submitData.request_id, taskId,
+  });
+  await updateGenerationAttempt(env, nextAttemptId, {
+    status: 'SUBMITTED', requestId: submitData.request_id,
+  });
+  await recordGenerationEvent(env, {
+    jobId: job.job_id, eventType: 'RETRY_SUBMITTED', fromStatus: 'RETRY', toStatus: 'SUBMITTED',
+    metadata: { request_id: submitData.request_id, attempt_no: decision.nextAttemptNo },
+  });
+  return { taskId, attemptId: nextAttemptId, attemptNo: decision.nextAttemptNo };
+}
+
 // Dipakai oleh route polling yang dipanggil ulang-ulang dari frontend.
 // Kredit dipotong HANYA saat status COMPLETED, dan hanya sekali per requestId.
 async function resolveFalTask(taskId, license, env) {
@@ -324,10 +497,23 @@ async function resolveFalTask(taskId, license, env) {
 
   const { t: creditType, m: modelId, r: requestId, j: jobId, a: attemptId } = decoded;
   const job = jobId ? await getGenerationJob(env, jobId).catch(() => null) : null;
+  const attempt = attemptId ? await getGenerationAttempt(env, attemptId).catch(() => null) : null;
   const elapsed = elapsedSeconds(job?.created_at);
+  let retryInput = null;
+  try {
+    const rawInput = jobId ? await env.hc_kv.get(retryInputKey(jobId)) : null;
+    retryInput = rawInput ? JSON.parse(rawInput) : null;
+  } catch { retryInput = null; }
   const r = await pollFalOnce(modelId, requestId, env).catch(() => ({ state: 'error', error: 'Layanan media gagal memproses permintaan' }));
 
   if (r.state === 'error') {
+    const retry = await retryProviderAttempt(env, job, attempt, 'MEDIA_ERROR').catch(() => null);
+    if (retry) {
+      return { result: {
+        status: 'retrying', stage: 'retry', elapsed_seconds: elapsed, done: false, failed: false,
+        url: null, retry_task_id: retry.taskId, retry_attempt_no: retry.attemptNo,
+      } };
+    }
     const settled = jobId ? await settleGenerationAtomic(env, {
       licenseKey: license.key,
       jobId,
@@ -349,6 +535,13 @@ async function resolveFalTask(taskId, license, env) {
   }
   if (r.state === 'pending') {
     if (job?.created_at && shouldExpireGeneration(job.created_at)) {
+      const retry = await retryProviderAttempt(env, job, attempt, 'TIMEOUT').catch(() => null);
+      if (retry) {
+        return { result: {
+          status: 'retrying', stage: 'retry', elapsed_seconds: elapsed, done: false, failed: false,
+          url: null, retry_task_id: retry.taskId, retry_attempt_no: retry.attemptNo,
+        } };
+      }
       const expired = await settleGenerationAtomic(env, {
         licenseKey: license.key,
         jobId,
@@ -390,6 +583,13 @@ async function resolveFalTask(taskId, license, env) {
 
   const url = r.data.video?.url || r.data.images?.[0]?.url || findUrl(r.data);
   if (!url) {
+    const retry = await retryProviderAttempt(env, job, attempt, 'NO_RESULT').catch(() => null);
+    if (retry) {
+      return { result: {
+        status: 'retrying', stage: 'retry', elapsed_seconds: elapsed, done: false, failed: false,
+        url: null, retry_task_id: retry.taskId, retry_attempt_no: retry.attemptNo,
+      } };
+    }
     const settled = jobId ? await settleGenerationAtomic(env, {
       licenseKey: license.key,
       jobId,
@@ -410,17 +610,49 @@ async function resolveFalTask(taskId, license, env) {
     return { result: { status: 'failed', stage: 'failed', elapsed_seconds: elapsed, done: false, failed: true, url: null, error: 'Tidak ada file hasil dari layanan media' } };
   }
 
+  const retained = jobId ? await validateAndRetainOutput(env, {
+    job, attemptId, url, providerData: r.data,
+    prompt: retryInput?.prompt, durationSeconds: retryInput?.duration,
+  }).catch(() => ({ ok: false, reason: 'VALIDATION_FAILED' })) : { ok: false };
+  if (!retained.ok) {
+    const released = jobId ? await settleGenerationAtomic(env, {
+      licenseKey: license.key, jobId, attemptId, creditType,
+      settlement: 'RELEASE', errorCode: retained.reason || 'VALIDATION_FAILED',
+      errorMessage: 'Output gagal melewati validation atau retention gate',
+      metadata: { request_id: requestId },
+    }).catch(() => ({ ok: false })) : { ok: false };
+    if (!released.ok) return { result: {
+      status: 'settlement_pending', stage: 'settlement', elapsed_seconds: elapsed,
+      done: false, failed: false, url: null,
+      error: 'Validation gagal dan settlement quota sedang dipulihkan.',
+    } };
+    return { result: {
+      status: 'failed', stage: 'validation', elapsed_seconds: elapsed,
+      done: false, failed: true, url: null,
+      error: `Output ditolak oleh quality gate (${retained.reason || 'VALIDATION_FAILED'})`,
+    } };
+  }
+
   const committed = jobId ? await settleGenerationAtomic(env, {
     licenseKey: license.key,
     jobId,
     attemptId,
     creditType,
     settlement: 'COMMIT',
-    resultUrl: url,
-    metadata: { request_id: requestId, result_url: url },
+    resultUrl: retained.internalUrl,
+    metadata: { request_id: requestId, result_url: retained.internalUrl },
   }).catch(() => ({ ok: false })) : { ok: false };
   if (committed.ok) {
-    return { result: { status: 'completed', stage: 'completed', elapsed_seconds: elapsed, done: true, failed: false, url } };
+    if (!committed.duplicate && job) {
+      const registry = job.flow === 't2i' ? ENGINES.imageGenerate
+        : job.flow === 'i2i' ? ENGINES.imageEdit
+          : job.flow === 'i2v' ? ENGINES.videoI2V : ENGINES.videoT2V;
+      if (registry.premium.id === job.model_id) {
+        await commitPremiumUsage(env, license, job.flow);
+      }
+    }
+    await clearRetryInput(env, jobId);
+    return { result: { status: 'completed', stage: 'completed', elapsed_seconds: elapsed, done: true, failed: false, url: retained.internalUrl } };
   }
 
   if (jobId) {
@@ -431,34 +663,10 @@ async function resolveFalTask(taskId, license, env) {
     } };
   }
 
-  const chargeFlagKey = `charged:${requestId}`;
-  const chargeLockKey = `charge-lock:${requestId}`;
-  const alreadyCharged = await env.hc_kv.get(chargeFlagKey);
-  if (!alreadyCharged && await acquireLock(env, chargeLockKey, KV_MIN_EXPIRATION_TTL_SECONDS)) {
-    try {
-      const currentRaw = await env.hc_kv.get(license.key);
-      const currentEntry = currentRaw ? JSON.parse(currentRaw) : null;
-      if (currentEntry && !(await env.hc_kv.get(chargeFlagKey))) {
-        await deductCredit(env, license.key, currentEntry, creditType);
-        await env.hc_kv.put(chargeFlagKey, '1', { expirationTtl: 86400 });
-        await recordQuotaLedger(env, {
-          licenseKey: license.key,
-          jobId,
-          eventType: 'COMPLETED',
-          creditType,
-          units: -1,
-          idempotencyKey: `charge:${requestId}`,
-          metadata: { request_id: requestId },
-        });
-      }
-    } finally {
-      await releaseLock(env, chargeLockKey);
-    }
-  }
-
-  await updateGenerationJob(env, jobId, { status: 'COMPLETED', resultUrl: url, completedAt: new Date().toISOString() });
-
-  return { result: { status: 'completed', done: true, failed: false, url } };
+  return { result: {
+    status: 'legacy_task_unsupported', stage: 'migration', done: false, failed: true, url: null,
+    error: 'Task lama tanpa metadata D1 tidak dapat diselesaikan; kirim generation baru.',
+  } };
 }
 
 // ─────────────────────────────────────────────
@@ -471,8 +679,10 @@ function handleHealth(env) {
   const brainReady = llm.ready;
   const kvReady = !!env.hc_kv;
   const d1 = d1Status(env);
+  const assetStorageReady = !!env.HC_ASSETS;
+  const qualityGateReady = d1.configured && assetStorageReady;
   return json({
-    ok: mediaReady && brainReady && kvReady,
+    ok: mediaReady && brainReady && kvReady && qualityGateReady,
     build: BUILD_VERSION,
     runtime: 'hclabs',
     apiVersion: 'v2',
@@ -480,6 +690,8 @@ function handleHealth(env) {
     brainReady,
     kvReady,
     d1Ready: d1.configured,
+    assetStorageReady,
+    qualityGateReady,
     d1Binding: d1.binding,
     imageProvider: 'media-engine',
     videoProvider: 'media-engine',
@@ -500,13 +712,14 @@ async function handleBrainRefineRoute(request, env) {
   if (!license.ok) return err(license.error, license.status);
 
   const lockKey = `inflight:${license.key}:brain`;
-  if (!(await acquireLock(env, lockKey, 60))) {
+  const lockToken = await acquireLock(env, lockKey, 60);
+  if (!lockToken) {
     return err('Permintaan sebelumnya masih diproses, tunggu beberapa detik.', 429);
   }
 
   try {
     const brainModel = providerConfig(env, selectedProvider(env)).model || DEFAULT_BRAIN_MODEL;
-    const spend = await checkAndRecordSpend(env, brainModel);
+    const spend = await checkAndRecordSpend(env, brainModel, `brain:${license.key}:${crypto.randomUUID()}`);
     if (!spend.allowed) return err('Batas biaya API harian tercapai. Coba lagi besok atau hubungi admin.', 503);
 
     const result = await handleBrainRefine(request, env, license);
@@ -515,7 +728,7 @@ async function handleBrainRefineRoute(request, env) {
   } catch (e) {
     return err('Conversation Brain gagal memproses permintaan.', 502);
   } finally {
-    await releaseLock(env, lockKey);
+    await releaseLock(env, lockKey, lockToken);
   }
 }
 
@@ -545,7 +758,8 @@ async function handleImageGenerate(request, env) {
   if (typeof prompt !== 'string' || prompt.length > 8000) return err('prompt terlalu panjang (maksimal 8.000 karakter)', 413);
 
   const lockKey = `inflight:${license.key}:t2i`;
-  if (!(await acquireLock(env, lockKey, 60))) {
+  const lockToken = await acquireLock(env, lockKey, 60);
+  if (!lockToken) {
     return err('Permintaan sebelumnya masih diproses, tunggu beberapa detik.', 429);
   }
 
@@ -582,7 +796,7 @@ async function handleImageGenerate(request, env) {
       return err('Quota safety layer belum siap. Generation tidak dikirim ke provider.', 503);
     }
 
-    const spend = await checkAndRecordSpend(env, modelCfg.id);
+    const spend = await checkAndRecordSpend(env, modelCfg.id, `generation:${jobId}`);
     if (!spend.allowed) {
       await settleGenerationAtomic(env, {
         licenseKey: license.key, jobId, attemptId: reservation.attemptId,
@@ -593,8 +807,13 @@ async function handleImageGenerate(request, env) {
     }
 
     let submitData;
+    await rememberRetryInput(env, jobId, { flow: 't2i', prompt, size });
     try { submitData = await submitImageGenerate(modelCfg, { prompt, size }, env); }
     catch {
+      const retry = await retryProviderAttempt(
+        env, await getGenerationJob(env, jobId), await getGenerationAttempt(env, reservation.attemptId), 'MEDIA_SUBMIT_FAILED',
+      ).catch(() => null);
+      if (retry) return json({ pending: true, taskId: retry.taskId, provider: 'fal', retried: true });
       await settleGenerationAtomic(env, {
         licenseKey: license.key, jobId, attemptId: reservation.attemptId,
         creditType: 'image', settlement: 'RELEASE',
@@ -602,9 +821,7 @@ async function handleImageGenerate(request, env) {
       });
       return err('Layanan media gagal menerima permintaan gambar. Kuota tidak dipotong.', 502);
     }
-    if (usePremium) await commitPremiumUsage(env, license, 't2i');
-
-    const taskId = encodeTaskId('image', modelCfg.id, submitData.request_id, {
+        const taskId = encodeTaskId('image', modelCfg.id, submitData.request_id, {
       j: jobId, a: reservation.attemptId,
     });
     await updateGenerationJob(env, jobId, { status: 'SUBMITTED', requestId: submitData.request_id, taskId });
@@ -617,6 +834,10 @@ async function handleImageGenerate(request, env) {
     const r = await pollFalSync(modelCfg.id, submitData.request_id, env);
 
     if (r.state === 'error') {
+      const retry = await retryProviderAttempt(
+        env, await getGenerationJob(env, jobId), await getGenerationAttempt(env, reservation.attemptId), 'MEDIA_ERROR',
+      ).catch(() => null);
+      if (retry) return json({ pending: true, taskId: retry.taskId, provider: 'fal', retried: true });
       const settled = await settleGenerationAtomic(env, {
         licenseKey: license.key, jobId, attemptId: reservation.attemptId,
         creditType: 'image', settlement: 'RELEASE',
@@ -630,6 +851,10 @@ async function handleImageGenerate(request, env) {
     if (r.state === 'done') {
       const url = r.data.images?.[0]?.url || findUrl(r.data);
       if (!url) {
+        const retry = await retryProviderAttempt(
+          env, await getGenerationJob(env, jobId), await getGenerationAttempt(env, reservation.attemptId), 'NO_RESULT',
+        ).catch(() => null);
+        if (retry) return json({ pending: true, taskId: retry.taskId, provider: 'fal', retried: true });
         const settled = await settleGenerationAtomic(env, {
           licenseKey: license.key, jobId, attemptId: reservation.attemptId,
           creditType: 'image', settlement: 'RELEASE', errorCode: 'NO_RESULT',
@@ -638,18 +863,18 @@ async function handleImageGenerate(request, env) {
         if (!settled.ok) return err('Settlement quota belum selesai; coba polling ulang.', 503);
         return err('Tidak ada gambar dari layanan media', 502);
       }
-      const committed = await settleGenerationAtomic(env, {
-        licenseKey: license.key, jobId, attemptId: reservation.attemptId,
-        creditType: 'image', settlement: 'COMMIT', resultUrl: url,
-        metadata: { request_id: submitData.request_id, result_url: url },
+      const finalized = await finalizeSynchronousOutput(env, {
+        licenseKey: license.key, jobId, attemptId: reservation.attemptId, creditType: 'image',
+        url, providerData: r.data, prompt, requestId: submitData.request_id,
       });
-      if (!committed.ok) return err('Settlement quota belum selesai; coba polling ulang.', 503);
-      return json({ type: 'url', url, provider: 'fal', engine: label });
+      if (!finalized.ok) return err(`Output ditolak quality gate (${finalized.reason})`, 502);
+      if (usePremium && !finalized.duplicate) await commitPremiumUsage(env, license, 't2i');
+      return json({ type: 'url', url: finalized.url, provider: 'fal', engine: label });
     }
 
     return json({ pending: true, taskId, provider: 'fal' });
   } finally {
-    await releaseLock(env, lockKey);
+    await releaseLock(env, lockKey, lockToken);
   }
 }
 
@@ -669,7 +894,8 @@ async function handleImageEdit(request, env) {
   if (!image) return err('Gambar sumber wajib diupload');
 
   const lockKey = `inflight:${license.key}:i2i`;
-  if (!(await acquireLock(env, lockKey, 60))) {
+  const lockToken = await acquireLock(env, lockKey, 60);
+  if (!lockToken) {
     return err('Permintaan sebelumnya masih diproses, tunggu beberapa detik.', 429);
   }
 
@@ -708,7 +934,7 @@ async function handleImageEdit(request, env) {
       return err('Quota safety layer belum siap. Generation tidak dikirim ke provider.', 503);
     }
 
-    const spend = await checkAndRecordSpend(env, modelCfg.id);
+    const spend = await checkAndRecordSpend(env, modelCfg.id, `generation:${jobId}`);
     if (!spend.allowed) {
       await settleGenerationAtomic(env, {
         licenseKey: license.key, jobId, attemptId: reservation.attemptId,
@@ -719,8 +945,13 @@ async function handleImageEdit(request, env) {
     }
 
     let submitData;
+    await rememberRetryInput(env, jobId, { flow: 'i2i', prompt, image });
     try { submitData = await submitImageEdit(modelCfg, { prompt, image }, env); }
     catch {
+      const retry = await retryProviderAttempt(
+        env, await getGenerationJob(env, jobId), await getGenerationAttempt(env, reservation.attemptId), 'MEDIA_SUBMIT_FAILED',
+      ).catch(() => null);
+      if (retry) return json({ pending: true, taskId: retry.taskId, provider: 'fal', retried: true });
       await settleGenerationAtomic(env, {
         licenseKey: license.key, jobId, attemptId: reservation.attemptId,
         creditType: 'image', settlement: 'RELEASE',
@@ -728,9 +959,7 @@ async function handleImageEdit(request, env) {
       });
       return err('Layanan media gagal menerima permintaan edit. Kuota tidak dipotong.', 502);
     }
-    if (usePremium) await commitPremiumUsage(env, license, 'i2i');
-
-    const taskId = encodeTaskId('image', modelCfg.id, submitData.request_id, {
+        const taskId = encodeTaskId('image', modelCfg.id, submitData.request_id, {
       j: jobId, a: reservation.attemptId,
     });
     await updateGenerationJob(env, jobId, { status: 'SUBMITTED', requestId: submitData.request_id, taskId });
@@ -743,6 +972,10 @@ async function handleImageEdit(request, env) {
     const r = await pollFalSync(modelCfg.id, submitData.request_id, env);
 
     if (r.state === 'error') {
+      const retry = await retryProviderAttempt(
+        env, await getGenerationJob(env, jobId), await getGenerationAttempt(env, reservation.attemptId), 'MEDIA_ERROR',
+      ).catch(() => null);
+      if (retry) return json({ pending: true, taskId: retry.taskId, provider: 'fal', retried: true });
       const settled = await settleGenerationAtomic(env, {
         licenseKey: license.key, jobId, attemptId: reservation.attemptId,
         creditType: 'image', settlement: 'RELEASE',
@@ -756,6 +989,10 @@ async function handleImageEdit(request, env) {
     if (r.state === 'done') {
       const url = r.data.images?.[0]?.url || findUrl(r.data);
       if (!url) {
+        const retry = await retryProviderAttempt(
+          env, await getGenerationJob(env, jobId), await getGenerationAttempt(env, reservation.attemptId), 'NO_RESULT',
+        ).catch(() => null);
+        if (retry) return json({ pending: true, taskId: retry.taskId, provider: 'fal', retried: true });
         const settled = await settleGenerationAtomic(env, {
           licenseKey: license.key, jobId, attemptId: reservation.attemptId,
           creditType: 'image', settlement: 'RELEASE', errorCode: 'NO_RESULT',
@@ -764,18 +1001,18 @@ async function handleImageEdit(request, env) {
         if (!settled.ok) return err('Settlement quota belum selesai; coba polling ulang.', 503);
         return err('Tidak ada gambar hasil edit dari layanan media', 502);
       }
-      const committed = await settleGenerationAtomic(env, {
-        licenseKey: license.key, jobId, attemptId: reservation.attemptId,
-        creditType: 'image', settlement: 'COMMIT', resultUrl: url,
-        metadata: { request_id: submitData.request_id, result_url: url },
+      const finalized = await finalizeSynchronousOutput(env, {
+        licenseKey: license.key, jobId, attemptId: reservation.attemptId, creditType: 'image',
+        url, providerData: r.data, prompt, requestId: submitData.request_id,
       });
-      if (!committed.ok) return err('Settlement quota belum selesai; coba polling ulang.', 503);
-      return json({ type: 'url', url, provider: 'fal', engine: label });
+      if (!finalized.ok) return err(`Output ditolak quality gate (${finalized.reason})`, 502);
+      if (usePremium && !finalized.duplicate) await commitPremiumUsage(env, license, 'i2i');
+      return json({ type: 'url', url: finalized.url, provider: 'fal', engine: label });
     }
 
     return json({ pending: true, taskId, provider: 'fal' });
   } finally {
-    await releaseLock(env, lockKey);
+    await releaseLock(env, lockKey, lockToken);
   }
 }
 
@@ -818,7 +1055,8 @@ async function handleVideoGenerate(request, env) {
 
   const flowKey = image ? 'i2v' : 't2v';
   const lockKey = `inflight:${license.key}:${flowKey}`;
-  if (!(await acquireLock(env, lockKey, 60))) {
+  const lockToken = await acquireLock(env, lockKey, 60);
+  if (!lockToken) {
     return err('Permintaan sebelumnya masih diproses, tunggu beberapa detik.', 429);
   }
 
@@ -867,7 +1105,7 @@ async function handleVideoGenerate(request, env) {
       return err('Quota safety layer belum siap. Generation tidak dikirim ke provider.', 503);
     }
 
-    const spend = await checkAndRecordSpend(env, modelCfg.id);
+    const spend = await checkAndRecordSpend(env, modelCfg.id, `generation:${jobId}`);
     if (!spend.allowed) {
       await settleGenerationAtomic(env, {
         licenseKey: license.key, jobId, attemptId: reservation.attemptId,
@@ -878,9 +1116,16 @@ async function handleVideoGenerate(request, env) {
     }
 
     let submitData;
+    await rememberRetryInput(env, jobId, {
+      flow: image ? 'i2v' : 't2v', prompt, image, ratio, duration: durationSeconds,
+    });
     try {
       submitData = await submitVideo(modelCfg, { prompt, image, ratio, duration: durationSeconds }, env);
     } catch {
+      const retry = await retryProviderAttempt(
+        env, await getGenerationJob(env, jobId), await getGenerationAttempt(env, reservation.attemptId), 'MEDIA_SUBMIT_FAILED',
+      ).catch(() => null);
+      if (retry) return json({ pending: true, taskId: retry.taskId, provider: 'fal', retried: true });
       await settleGenerationAtomic(env, {
         licenseKey: license.key, jobId, attemptId: reservation.attemptId,
         creditType: 'video', settlement: 'RELEASE',
@@ -903,10 +1148,9 @@ async function handleVideoGenerate(request, env) {
       jobId, eventType: 'SUBMITTED', fromStatus: 'RESERVED', toStatus: 'SUBMITTED',
       metadata: { request_id: submitData.request_id },
     });
-    if (usePremium) await commitPremiumUsage(env, license, flowKey);
-    return json({ taskId, provider: 'fal', duration_seconds: durationSeconds, aspect_ratio: ratio });
+        return json({ taskId, provider: 'fal', duration_seconds: durationSeconds, aspect_ratio: ratio });
   } finally {
-    await releaseLock(env, lockKey);
+    await releaseLock(env, lockKey, lockToken);
   }
 }
 
@@ -977,6 +1221,20 @@ async function handleDiagnostics(request, env) {
   return json({ ok: results.every(r => r.ok), results });
 }
 
+async function handleStoredAsset(env, encodedKey) {
+  let key;
+  try { key = decodeURIComponent(encodedKey); } catch { return err('Asset key tidak valid', 400); }
+  const object = await getStoredAsset(env, key);
+  if (!object) return err('Asset tidak ditemukan', 404);
+  const headers = {
+    ...CORS,
+    'Cache-Control': 'public, max-age=31536000, immutable',
+    'Content-Type': object.httpMetadata?.contentType || 'application/octet-stream',
+  };
+  if (object.httpEtag) headers.ETag = object.httpEtag;
+  return new Response(object.body, { status: 200, headers });
+}
+
 // ─────────────────────────────────────────────
 // MAIN ROUTER
 // ─────────────────────────────────────────────
@@ -989,6 +1247,7 @@ export default {
     const parts = path.split('/');
     try {
       if (path === '/api/health')                                        return await handleHealth(env);
+      if (path.startsWith('/api/assets/') && request.method === 'GET') return await handleStoredAsset(env, path.slice('/api/assets/'.length));
       if (path === '/api/models')                                        return await handleModels(env);
       if (path === '/api/activate'        && request.method === 'POST') return await handleActivate(request, env);
       if (path === '/api/license/status'  && request.method === 'GET')  return await handleLicenseStatus(request, env);

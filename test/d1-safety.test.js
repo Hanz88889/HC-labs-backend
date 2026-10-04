@@ -3,11 +3,14 @@ import assert from 'node:assert/strict';
 import {
   countActiveGenerationJobs,
   createGenerationAttempt,
+  acquireOperationLock,
   getD1QuotaBalances,
   getIdempotencyRecord,
   recordGenerationEvent,
   recordValidationResult,
   reserveGenerationAtomic,
+  reserveDailySpendAtomic,
+  releaseOperationLock,
   settleGenerationAtomic,
   updateGenerationAttempt,
 } from '../d1-store.js';
@@ -175,4 +178,24 @@ test('reads current image and video quota balances from D1', async () => {
     { credit_type: 'video', available_units: 2 },
   ]);
   assert.match(db.prepared[0].sql, /FROM quota_balances/);
+});
+
+test('acquires and releases an owner-token D1 operation lock', async () => {
+  const db = fakeDb();
+  const token = await acquireOperationLock({ HC_DB: db }, 'inflight:HC-001:t2i', 60);
+  assert.match(token, /^[0-9a-f-]{36}$/);
+  assert.match(db.prepared[0].sql, /DELETE FROM operation_locks/);
+  assert.match(db.prepared[1].sql, /INSERT OR IGNORE INTO operation_locks/);
+  assert.equal(await releaseOperationLock({ HC_DB: db }, 'inflight:HC-001:t2i', token), true);
+});
+
+test('reserves daily spend atomically and recognizes duplicate reservation', async () => {
+  const db = fakeDb();
+  const out = await reserveDailySpendAtomic({ HC_DB: db }, {
+    dayKey: 'spend:2026-10-04', reservationId: 'generation:JOB-001', amountUsd: 0.2, capUsd: 5,
+  });
+  assert.equal(out.ok, true);
+  assert.equal(out.duplicate, false);
+  assert.match(db.prepared[1].sql, /spend_reservations/);
+  assert.match(db.prepared[2].sql, /spent_usd = spent_usd \+ \?1/);
 });
