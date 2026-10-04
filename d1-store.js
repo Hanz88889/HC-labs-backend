@@ -506,3 +506,68 @@ export async function settleGenerationAtomic(env, input) {
   if (existing) return { ok: true, duplicate: true, settlement, jobId };
   return { ok: false, reason: 'NO_RESERVATION', jobId };
 }
+
+
+export async function upsertModelRegistry(env, model) {
+  if (!dbReady(env) || !model?.modelKey || !model?.modelId) return false;
+  await env.HC_DB.prepare(`
+    INSERT INTO model_registry (model_key,provider,model_id,label,active,updated_at)
+    VALUES (?1,?2,?3,?4,?5,CURRENT_TIMESTAMP)
+    ON CONFLICT(model_key) DO UPDATE SET
+      provider=excluded.provider, model_id=excluded.model_id, label=excluded.label,
+      active=excluded.active, updated_at=CURRENT_TIMESTAMP
+  `).bind(
+    model.modelKey, model.provider || 'unknown', model.modelId, model.label || model.modelKey,
+    model.active === false ? 0 : 1,
+  ).run();
+  return true;
+}
+
+export async function recordModelCapability(env, capability) {
+  if (!dbReady(env) || !capability?.modelKey || !capability?.name) return false;
+  await env.HC_DB.prepare(`
+    INSERT INTO model_capabilities (model_key,capability,supported,metadata_json)
+    VALUES (?1,?2,?3,?4)
+    ON CONFLICT(model_key,capability) DO UPDATE SET
+      supported=excluded.supported, metadata_json=excluded.metadata_json
+  `).bind(
+    capability.modelKey, capability.name, capability.supported === false ? 0 : 1,
+    capability.metadata ? JSON.stringify(capability.metadata) : null,
+  ).run();
+  return true;
+}
+
+export async function recordModelPricing(env, pricing) {
+  if (!dbReady(env) || !pricing?.modelKey || !pricing?.pricingKey) return false;
+  await env.HC_DB.prepare(`
+    INSERT INTO model_pricing (model_key,pricing_key,unit,amount_usd,effective_from,effective_until)
+    VALUES (?1,?2,?3,?4,COALESCE(?5,CURRENT_TIMESTAMP),?6)
+  `).bind(
+    pricing.modelKey, pricing.pricingKey, pricing.unit || 'request', Number(pricing.amountUsd || 0),
+    pricing.effectiveFrom || null, pricing.effectiveUntil || null,
+  ).run();
+  return true;
+}
+
+export async function recordCostRecord(env, cost) {
+  if (!dbReady(env) || !cost?.provider) return false;
+  await env.HC_DB.prepare(`
+    INSERT OR IGNORE INTO cost_records
+      (cost_record_id,job_id,attempt_id,model_key,provider,estimated_cost_usd,actual_cost_usd,currency,usage_json)
+    VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+  `).bind(
+    cost.costRecordId || crypto.randomUUID(), cost.jobId || null, cost.attemptId || null,
+    cost.modelKey || null, cost.provider, Number(cost.estimatedCostUsd || 0),
+    cost.actualCostUsd == null ? null : Number(cost.actualCostUsd), cost.currency || 'USD',
+    cost.usage ? JSON.stringify(cost.usage) : null,
+  ).run();
+  return true;
+}
+
+export async function listPersistedModels(env) {
+  if (!dbReady(env)) return [];
+  const result = await env.HC_DB.prepare(`
+    SELECT model_key,provider,model_id,label,active FROM model_registry ORDER BY model_key
+  `).all();
+  return result?.results || [];
+}
