@@ -2,6 +2,7 @@ import { callBrainProvider } from './llm-router.js';
 import { normalizeContentPlanV1 } from './task-spec.js';
 import { buildContentBlueprint } from './content-blueprint.js';
 import { compilePrompt } from './prompt-compiler.js';
+import { routeTaskSpec } from './capability-registry.js';
 
 const PLAN_SCHEMA = 'hclabs.content-plan.v1';
 const SESSION_TTL = 60 * 60 * 24 * 30;
@@ -81,6 +82,7 @@ export async function handleBrainRefine(request, env, license) {
   const taskSpec = normalizeContentPlanV1(plan);
   const contentBlueprint = buildContentBlueprint(taskSpec, plan.workflow || null);
   const compiledPrompt = compilePrompt(taskSpec, contentBlueprint);
+  const routing = routeTaskSpec(taskSpec);
 
   if (env.hc_kv) {
     const context = [...(previous?.context || []), { input, goal, tone, format, plan }].slice(-8);
@@ -95,6 +97,7 @@ export async function handleBrainRefine(request, env, license) {
     task_spec: taskSpec,
     content_blueprint: contentBlueprint,
     compiled_prompt: compiledPrompt,
+    routing,
     usage: llm.usage,
     provider: 'llm-router',
   };

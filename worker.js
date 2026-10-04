@@ -33,6 +33,7 @@ import { providerConfig, selectedProvider } from './llm-router.js';
 import { GENERATION_POLICY, elapsedSeconds, shouldExpireGeneration, retryDecision } from './job-lifecycle.js';
 import { validateOutputContract, validateStoredAsset } from './output-validator.js';
 import { persistGeneratedAsset, getStoredAsset } from './asset-store.js';
+import { listCapabilities } from './capability-registry.js';
 import {
   getD1License, getD1QuotaBalances, upsertD1License, migrateKvLicense, d1Status,
   updateGenerationJob,
@@ -743,6 +744,10 @@ async function handleModels(env) {
   });
 }
 
+function handleCapabilities() {
+  return json({ schema: 'hclabs.capability-registry.v1', capabilities: listCapabilities() });
+}
+
 // ─────────────────────────────────────────────
 // POST /api/images/generate
 // ─────────────────────────────────────────────
@@ -1249,6 +1254,7 @@ export default {
       if (path === '/api/health')                                        return await handleHealth(env);
       if (path.startsWith('/api/assets/') && request.method === 'GET') return await handleStoredAsset(env, path.slice('/api/assets/'.length));
       if (path === '/api/models')                                        return await handleModels(env);
+      if (path === '/api/capabilities')                                  return handleCapabilities();
       if (path === '/api/activate'        && request.method === 'POST') return await handleActivate(request, env);
       if (path === '/api/license/status'  && request.method === 'GET')  return await handleLicenseStatus(request, env);
       if (path === '/api/admin/bulk-import' && request.method === 'POST') return await handleBulkImport(request, env);
