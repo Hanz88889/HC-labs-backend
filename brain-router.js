@@ -1,4 +1,7 @@
 import { callBrainProvider } from './llm-router.js';
+import { normalizeContentPlanV1 } from './task-spec.js';
+import { buildContentBlueprint } from './content-blueprint.js';
+import { compilePrompt } from './prompt-compiler.js';
 
 const PLAN_SCHEMA = 'hclabs.content-plan.v1';
 const SESSION_TTL = 60 * 60 * 24 * 30;
@@ -75,11 +78,24 @@ export async function handleBrainRefine(request, env, license) {
   try { plan = JSON.parse(stripJsonFences(llm.content)); }
   catch { throw new Error('Response layanan bahasa bukan JSON valid'); }
   plan = validatePlan(plan, { conversation_id: conversationId });
+  const taskSpec = normalizeContentPlanV1(plan);
+  const contentBlueprint = buildContentBlueprint(taskSpec, plan.workflow || null);
+  const compiledPrompt = compilePrompt(taskSpec, contentBlueprint);
 
   if (env.hc_kv) {
     const context = [...(previous?.context || []), { input, goal, tone, format, plan }].slice(-8);
     await env.hc_kv.put(sessionKey, JSON.stringify({ conversation_id: conversationId, context }), { expirationTtl: SESSION_TTL });
   }
 
-  return { ok: true, conversation_id: conversationId, model: 'configured-model', plan, usage: llm.usage, provider: 'llm-router' };
+  return {
+    ok: true,
+    conversation_id: conversationId,
+    model: 'configured-model',
+    plan,
+    task_spec: taskSpec,
+    content_blueprint: contentBlueprint,
+    compiled_prompt: compiledPrompt,
+    usage: llm.usage,
+    provider: 'llm-router',
+  };
 }
