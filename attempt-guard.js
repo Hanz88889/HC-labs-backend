@@ -3,6 +3,7 @@ export const ATTEMPT_LIMITS = {
   lockSeconds: 900,
   perIp: 10,
   perLicense: 5,
+  adminPerIp: 5,
   warnAtRemaining: 2,
 };
 
@@ -22,10 +23,10 @@ function licenseScope(licenseKey) {
   return `lic:${String(licenseKey).slice(0, 200)}`;
 }
 
-export async function checkAttemptBlock(env, request, licenseKey) {
+export async function checkAttemptBlock(env, request, licenseKey, options = {}) {
   if (!dbReady(env)) return { blocked: false, retryAfterSeconds: 0 };
   try {
-    const scopes = [`ip:${clientIp(request)}`];
+    const scopes = [`${options.scopePrefix || 'ip'}:${clientIp(request)}`];
     if (licenseKey) scopes.push(licenseScope(licenseKey));
     const now = nowEpoch();
     const row = await env.HC_DB.prepare(`
@@ -66,7 +67,11 @@ async function bumpScope(env, scope, limit) {
 export async function recordFailedAttempt(env, request, licenseKey, options = {}) {
   if (!dbReady(env)) return { blocked: false, remaining: null };
   try {
-    const ip = await bumpScope(env, `ip:${clientIp(request)}`, ATTEMPT_LIMITS.perIp);
+    const ip = await bumpScope(
+      env,
+      `${options.scopePrefix || 'ip'}:${clientIp(request)}`,
+      options.ipLimit || ATTEMPT_LIMITS.perIp,
+    );
     let blocked = ip.blocked;
     let remaining = ip.remaining;
     if (options.licenseKnown && licenseKey) {

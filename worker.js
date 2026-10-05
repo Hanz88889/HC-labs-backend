@@ -310,17 +310,43 @@ async function handleLicenseStatus(request, env) {
 // ─────────────────────────────────────────────
 // POST /api/admin/bulk-import — TIDAK DIUBAH
 // ─────────────────────────────────────────────
+async function secretsEqual(a, b) {
+  const encoder = new TextEncoder();
+  const [da, db] = await Promise.all([
+    crypto.subtle.digest('SHA-256', encoder.encode(String(a))),
+    crypto.subtle.digest('SHA-256', encoder.encode(String(b))),
+  ]);
+  const x = new Uint8Array(da);
+  const y = new Uint8Array(db);
+  let diff = 0;
+  for (let i = 0; i < x.length; i++) diff |= x[i] ^ y[i];
+  return diff === 0;
+}
+
+async function adminGate(request, env, bodySecret = '') {
+  const gate = await checkAttemptBlock(env, request, null, { scopePrefix: 'admin' });
+  if (gate.blocked) return err(blockedMessage(gate.retryAfterSeconds), 429);
+  const configuredSecret = String(env.ADMIN_SECRET || '').trim();
+  const headerSecret = request.headers.get('X-Admin-Secret')?.trim() || '';
+  const authorization = request.headers.get('Authorization') || '';
+  const bearerSecret = authorization.match(/^Bearer\s+(.+)$/i)?.[1]?.trim() || '';
+  let matched = false;
+  if (configuredSecret) {
+    for (const candidate of [headerSecret, bearerSecret, bodySecret]) {
+      if (candidate && await secretsEqual(candidate, configuredSecret)) matched = true;
+    }
+  }
+  if (matched) return null;
+  await recordFailedAttempt(env, request, null, { scopePrefix: 'admin', ipLimit: ATTEMPT_LIMITS.adminPerIp });
+  return err('Unauthorized', 401);
+}
+
 async function handleBulkImport(request, env) {
   let body;
   try { body = await request.json(); } catch { return err('Body JSON tidak valid'); }
   const bodySecret = !Array.isArray(body) ? String(body?.adminSecret || '').trim() : '';
-  const headerSecret = request.headers.get('X-Admin-Secret')?.trim();
-  const authorization = request.headers.get('Authorization') || '';
-  const bearerSecret = authorization.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
-  const configuredSecret = String(env.ADMIN_SECRET || '').trim();
-  if (!configuredSecret || (![headerSecret, bearerSecret, bodySecret].includes(configuredSecret))) {
-    return err('Unauthorized', 401);
-  }
+  const denied = await adminGate(request, env, bodySecret);
+  if (denied) return denied;
 
   const entries = Array.isArray(body) ? body : body?.items;
   if (!Array.isArray(entries)) return err('Body harus array of {key, value} atau object dengan items');
@@ -336,13 +362,8 @@ async function handleBulkImport(request, env) {
 }
 
 async function handleD1Migration(request, env) {
-  const headerSecret = request.headers.get('X-Admin-Secret')?.trim();
-  const authorization = request.headers.get('Authorization') || '';
-  const bearerSecret = authorization.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
-  const configuredSecret = String(env.ADMIN_SECRET || '').trim();
-  if (!configuredSecret || (![headerSecret, bearerSecret].includes(configuredSecret))) {
-    return err('Unauthorized', 401);
-  }
+  const denied = await adminGate(request, env);
+  if (denied) return denied;
   if (!env.HC_DB) return err('D1 belum di-bind ke Worker', 503);
 
   let cursor;
