@@ -14,15 +14,30 @@ function sqliteD1() {
   for (const file of readdirSync(new URL('../migrations/', import.meta.url)).sort()) {
     sql.exec(readFileSync(new URL(`../migrations/${file}`, import.meta.url), 'utf8'));
   }
+  function sqliteStatement(text, params) {
+    const bound = [];
+    const normalized = text.replace(/\?(\d+)/g, (_, index) => {
+      bound.push(params[Number(index) - 1]);
+      return '?';
+    });
+    return { statement: sql.prepare(bound.length ? normalized : text), params: bound.length ? bound : params };
+  }
   const wrap = (text) => {
     const statement = { text, params: [] };
     statement.bind = (...params) => { statement.params = params; return statement; };
     statement.run = async () => {
-      const info = sql.prepare(text).run(...statement.params);
+      const bound = sqliteStatement(text, statement.params);
+      const info = bound.statement.run(...bound.params);
       return { success: true, meta: { changes: Number(info.changes) } };
     };
-    statement.first = async () => sql.prepare(text).get(...statement.params) || null;
-    statement.all = async () => ({ results: sql.prepare(text).all(...statement.params) });
+    statement.first = async () => {
+      const bound = sqliteStatement(text, statement.params);
+      return bound.statement.get(...bound.params) || null;
+    };
+    statement.all = async () => {
+      const bound = sqliteStatement(text, statement.params);
+      return { results: bound.statement.all(...bound.params) };
+    };
     return statement;
   };
   return {
