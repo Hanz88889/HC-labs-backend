@@ -53,7 +53,7 @@ const CORS = {
   'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-License-Key, X-License-Email, X-Admin-Secret, Idempotency-Key',
 };
 
-const BUILD_VERSION = 'phase-6-gap-closure-2026-10-04';
+const BUILD_VERSION = 'phase-8-reconciliation-2026-10-06';
 
 const json = (data, status = 200) =>
   new Response(JSON.stringify(data), {
