@@ -1,6 +1,6 @@
 export const ATTEMPT_LIMITS = {
-  windowSeconds: 900,
-  lockSeconds: 900,
+  windowSeconds: 60,
+  lockSeconds: 60,
   perIp: 10,
   perLicense: 5,
   adminPerIp: 5,
