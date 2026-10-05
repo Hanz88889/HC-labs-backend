@@ -368,3 +368,63 @@ test('prune removes only old unlocked attempt rows', async () => {
   const left = db.sql.prepare('SELECT scope_key k FROM auth_attempts ORDER BY k').all().map((r) => r.k);
   assert.deepEqual(left, ['ip:locked', 'ip:recent']);
 });
+
+function adminRequest(ip, headers = {}, body = { items: [{ key: 'HC-IMPORT', value: '{}' }] }) {
+  return new Request('https://api.test/api/admin/bulk-import', {
+    method: 'POST',
+    headers: { 'CF-Connecting-IP': ip, 'Content-Type': 'application/json', ...headers },
+    body: JSON.stringify(body),
+  });
+}
+
+function adminEnv(db, secret = 'rahasia-admin-panjang') {
+  const writes = [];
+  return {
+    env: { ...workerEnv(db), ADMIN_SECRET: secret, hc_kv: { async get() { return null; }, async put(k) { writes.push(k); } } },
+    writes,
+  };
+}
+
+test('admin endpoint accepts the right secret via header, bearer and body', async () => {
+  const db = sqliteD1();
+  const { env, writes } = adminEnv(db);
+  assert.equal((await worker.fetch(adminRequest('9.9.9.1', { 'X-Admin-Secret': 'rahasia-admin-panjang' }), env)).status, 200);
+  assert.equal((await worker.fetch(adminRequest('9.9.9.1', { Authorization: 'Bearer rahasia-admin-panjang' }), env)).status, 200);
+  const bodyAuth = await worker.fetch(
+    adminRequest('9.9.9.1', {}, { adminSecret: 'rahasia-admin-panjang', items: [{ key: 'HC-IMPORT-2', value: '{}' }] }),
+    env,
+  );
+  assert.equal(bodyAuth.status, 200);
+  assert.equal(writes.length, 3);
+});
+
+test('admin endpoint rejects wrong secrets and locks the ip after 5 failures', async () => {
+  const db = sqliteD1();
+  const { env, writes } = adminEnv(db);
+  const statuses = [];
+  for (let i = 0; i < 5; i++) {
+    statuses.push((await worker.fetch(adminRequest('9.9.9.2', { 'X-Admin-Secret': `tebakan-${i}` }), env)).status);
+  }
+  assert.deepEqual(statuses, [401, 401, 401, 401, 401]);
+  const locked = await worker.fetch(adminRequest('9.9.9.2', { 'X-Admin-Secret': 'rahasia-admin-panjang' }), env);
+  assert.equal(locked.status, 429);
+  const otherIp = await worker.fetch(adminRequest('9.9.9.3', { 'X-Admin-Secret': 'rahasia-admin-panjang' }), env);
+  assert.equal(otherIp.status, 200);
+  assert.equal(writes.length, 1);
+});
+
+test('admin endpoint stays closed when ADMIN_SECRET is not configured', async () => {
+  const db = sqliteD1();
+  const { env, writes } = adminEnv(db, '');
+  const res = await worker.fetch(adminRequest('9.9.9.4', { 'X-Admin-Secret': '' }), env);
+  assert.equal(res.status, 401);
+  assert.equal(writes.length, 0);
+});
+
+test('admin lock does not block normal license traffic from the same ip', async () => {
+  const db = sqliteD1(); seed(db);
+  const { env } = adminEnv(db);
+  for (let i = 0; i < 5; i++) await worker.fetch(adminRequest('9.9.9.5', { 'X-Admin-Secret': `salah-${i}` }), env);
+  const res = await worker.fetch(ipRequest('/api/license/status', '9.9.9.5', 'HC-A', 'hc-a@mail.test'), env);
+  assert.equal(res.status, 200);
+});
