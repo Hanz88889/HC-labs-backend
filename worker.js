@@ -15,11 +15,9 @@
 // nama brand yang sama (mis. "Aurum Vision"), baik lagi pakai premium
 // maupun budget. Threshold beda per tier (STD vs PRO) — lihat model-router.js.
 //
-// PENTING — belum ada di file ini: proses reset kredit bulanan (di luar
-// kode yang di-share ke Claude). Pastikan proses reset itu JUGA me-reset
-// entry.premiumUsage = { t2i:0, i2i:0, t2v:0, i2v:0 } setiap siklus baru,
-// bukan cuma entry.credits — kalau tidak, user akan permanen kejebak di
-// mode budget setelah bulan pertama.
+// MASA BERLAKU: setiap license berlaku 30 hari sejak aktivasi (bound_at).
+// Tidak ada reset kredit bulanan: perpanjangan = license baru dengan kredit
+// dan premiumUsage baru. Setelah 30 hari license ditolak di getValidLicense.
 // ─────────────────────────────────────────────
 
 import {
@@ -34,6 +32,10 @@ import { GENERATION_POLICY, elapsedSeconds, shouldExpireGeneration, retryDecisio
 import { validateOutputContract, validateStoredAsset } from './output-validator.js';
 import { persistGeneratedAsset, getStoredAsset } from './asset-store.js';
 import { listCapabilities } from './capability-registry.js';
+import {
+  checkAttemptBlock, recordFailedAttempt, pruneAuthAttempts,
+  blockedMessage, warningMessage, ATTEMPT_LIMITS,
+} from './attempt-guard.js';
 import { selectModelForFlow } from './model-router.js';
 import {
   getD1License, getD1QuotaBalances, upsertD1License, migrateKvLicense, d1Status,
@@ -157,6 +159,25 @@ async function requestFingerprint(payload) {
   return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
+const LICENSE_VALID_DAYS = 30;
+const LICENSE_EXPIRED_MESSAGE = 'Masa berlaku kode sudah habis (30 hari). Hubungi Admin Quorvante untuk kode baru.';
+
+function licenseExpired(entry) {
+  if (!entry || !entry.bound_at) return false;
+  const boundAt = Date.parse(entry.bound_at);
+  if (!Number.isFinite(boundAt)) return false;
+  return Date.now() >= boundAt + LICENSE_VALID_DAYS * 86400000;
+}
+
+async function failedCredentials(request, env, key, status, message, licenseKnown) {
+  const outcome = await recordFailedAttempt(env, request, key, { licenseKnown });
+  if (outcome.blocked) return { ok: false, status: 429, error: blockedMessage(ATTEMPT_LIMITS.lockSeconds) };
+  if (outcome.remaining !== null && outcome.remaining <= ATTEMPT_LIMITS.warnAtRemaining) {
+    return { ok: false, status, error: warningMessage(outcome.remaining) };
+  }
+  return { ok: false, status, error: message };
+}
+
 function getLicenseHeaders(request) {
   const key = request.headers.get('X-License-Key');
   const email = request.headers.get('X-License-Email');
@@ -169,10 +190,13 @@ async function getValidLicense(request, env) {
     return { ok: false, error: 'Key dan email wajib diisi', status: 401 };
   }
 
+  const gate = await checkAttemptBlock(env, request, key);
+  if (gate.blocked) return { ok: false, error: blockedMessage(gate.retryAfterSeconds), status: 429 };
+
   const d1License = await getD1License(env, key);
   const raw = d1License ? null : await env.hc_kv.get(key);
   if (!raw && !d1License) {
-    return { ok: false, error: 'Kode tidak valid', status: 404 };
+    return failedCredentials(request, env, key, 404, 'Kode tidak valid', false);
   }
 
   let entry = d1License?.entry;
@@ -187,11 +211,15 @@ async function getValidLicense(request, env) {
   }
 
   if (entry.email && entry.email.toLowerCase() !== email.toLowerCase()) {
-    return { ok: false, error: 'Kode ini terdaftar untuk email lain. Hubungi admin HC Labs', status: 403 };
+    return failedCredentials(request, env, key, 403, 'Kode ini terdaftar untuk email lain. Hubungi admin HC Labs', true);
   }
 
   if (!entry.email) {
-    return { ok: false, error: 'Key belum diaktivasi. Silakan aktivasi lebih dulu', status: 403 };
+    return failedCredentials(request, env, key, 403, 'Key belum diaktivasi. Silakan aktivasi lebih dulu', true);
+  }
+
+  if (licenseExpired(entry)) {
+    return { ok: false, error: LICENSE_EXPIRED_MESSAGE, status: 403 };
   }
 
   return { ok: true, key, entry, source: d1License ? 'd1' : 'kv' };
@@ -207,9 +235,15 @@ async function handleActivate(request, env) {
   const { key, email } = body;
   if (!key || !email) return err('Key dan email wajib diisi');
 
+  const gate = await checkAttemptBlock(env, request, key);
+  if (gate.blocked) return err(blockedMessage(gate.retryAfterSeconds), 429);
+
   const d1License = await getD1License(env, key);
   const raw = d1License ? null : await env.hc_kv.get(key);
-  if (!raw && !d1License) return err('Kode tidak valid', 404);
+  if (!raw && !d1License) {
+    const failed = await failedCredentials(request, env, key, 404, 'Kode tidak valid', false);
+    return err(failed.error, failed.status);
+  }
 
   let entry = d1License?.entry;
   if (!entry && raw) {
@@ -222,7 +256,12 @@ async function handleActivate(request, env) {
   }
 
   if (entry.email && entry.email.toLowerCase() !== email.toLowerCase()) {
-    return err('Kode ini sudah terdaftar untuk email lain. Hubungi admin HC Labs', 403);
+    const failed = await failedCredentials(request, env, key, 403, 'Kode ini sudah terdaftar untuk email lain. Hubungi admin HC Labs', true);
+    return err(failed.error, failed.status);
+  }
+
+  if (entry.email && licenseExpired(entry)) {
+    return err(LICENSE_EXPIRED_MESSAGE, 403);
   }
 
   if (!entry.email) {
@@ -1296,7 +1335,10 @@ async function handleStoredAsset(env, encodedKey) {
 // ─────────────────────────────────────────────
 export default {
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(expireStaleGenerations(env, { olderThanSeconds: 900, limit: 50 }));
+    ctx.waitUntil(Promise.all([
+      expireStaleGenerations(env, { olderThanSeconds: 900, limit: 50 }),
+      pruneAuthAttempts(env),
+    ]));
   },
   async fetch(request, env) {
     if (request.method === 'OPTIONS') {
