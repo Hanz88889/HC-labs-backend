@@ -7,6 +7,7 @@ import {
 } from '../d1-store.js';
 import worker from '../worker.js';
 import { encodeTaskId } from '../fal-client.js';
+import { pruneAuthAttempts } from '../attempt-guard.js';
 
 function sqliteD1() {
   const sql = new DatabaseSync(':memory:');
@@ -256,4 +257,114 @@ test('reserve stores quota balances readable through the status adapter', async 
   await reserve(db, 'HC-A', 'key-status-1');
   const balances = await getD1QuotaBalances({ HC_DB: db }, 'HC-A');
   assert.equal(balances.find((b) => b.credit_type === 'video').available_units, 4);
+});
+
+function ipRequest(path, ip, key, email, method = 'GET', body) {
+  return new Request(`https://api.test${path}`, {
+    method,
+    headers: {
+      'CF-Connecting-IP': ip, 'X-License-Key': key, 'X-License-Email': email, 'Content-Type': 'application/json',
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+}
+
+async function statusCall(db, ip, key, email) {
+  const res = await worker.fetch(ipRequest('/api/license/status', ip, key, email), workerEnv(db));
+  const data = await res.json().catch(() => ({}));
+  return { status: res.status, error: data.error || '' };
+}
+
+test('wrong email on a real license warns, then locks even for the correct email', async () => {
+  const db = sqliteD1(); seed(db);
+  const results = [];
+  for (let i = 0; i < 5; i++) results.push(await statusCall(db, '1.1.1.1', 'HC-A', 'salah@mail.test'));
+  assert.equal(results[0].status, 403);
+  assert.equal(results[1].status, 403);
+  assert.match(results[2].error, /Sisa percobaan: 2/);
+  assert.match(results[3].error, /Sisa percobaan: 1/);
+  assert.equal(results[4].status, 429);
+  assert.match(results[4].error, /Admin Quorvante/);
+  const correct = await statusCall(db, '1.1.1.1', 'HC-A', 'hc-a@mail.test');
+  assert.equal(correct.status, 429);
+  const otherIpCorrect = await statusCall(db, '2.2.2.2', 'HC-A', 'hc-a@mail.test');
+  assert.equal(otherIpCorrect.status, 429);
+});
+
+test('guessing unknown keys locks the ip but not other ips', async () => {
+  const db = sqliteD1(); seed(db);
+  let last;
+  for (let i = 0; i < 10; i++) last = await statusCall(db, '3.3.3.3', `HC-GUESS-${i}`, 'x@mail.test');
+  assert.equal(last.status, 429);
+  const sameIpValid = await statusCall(db, '3.3.3.3', 'HC-A', 'hc-a@mail.test');
+  assert.equal(sameIpValid.status, 429);
+  const otherIpValid = await statusCall(db, '4.4.4.4', 'HC-A', 'hc-a@mail.test');
+  assert.equal(otherIpValid.status, 200);
+});
+
+test('successful requests never consume attempts', async () => {
+  const db = sqliteD1(); seed(db);
+  for (let i = 0; i < 25; i++) {
+    const res = await statusCall(db, '5.5.5.5', 'HC-A', 'hc-a@mail.test');
+    assert.equal(res.status, 200);
+  }
+  assert.equal(db.sql.prepare('SELECT COUNT(*) c FROM auth_attempts').get().c, 0);
+});
+
+test('lock expires and the failure window resets', async () => {
+  const db = sqliteD1(); seed(db);
+  for (let i = 0; i < 5; i++) await statusCall(db, '6.6.6.6', 'HC-A', 'salah@mail.test');
+  assert.equal((await statusCall(db, '6.6.6.6', 'HC-A', 'hc-a@mail.test')).status, 429);
+  db.sql.exec('UPDATE auth_attempts SET locked_until_epoch = 1, window_start_epoch = 1');
+  assert.equal((await statusCall(db, '6.6.6.6', 'HC-A', 'hc-a@mail.test')).status, 200);
+  const wrong = await statusCall(db, '6.6.6.6', 'HC-A', 'salah@mail.test');
+  assert.equal(wrong.status, 403);
+  assert.equal(db.sql.prepare("SELECT failures f FROM auth_attempts WHERE scope_key = 'lic:HC-A'").get().f, 1);
+});
+
+test('activation also counts failures and locks', async () => {
+  const db = sqliteD1(); seed(db);
+  let last;
+  for (let i = 0; i < 5; i++) {
+    const res = await worker.fetch(
+      ipRequest('/api/activate', '7.7.7.7', '', '', 'POST', { key: 'HC-A', email: 'salah@mail.test' }),
+      workerEnv(db),
+    );
+    last = res.status;
+  }
+  assert.equal(last, 429);
+  const ok = await worker.fetch(
+    ipRequest('/api/activate', '7.7.7.7', '', '', 'POST', { key: 'HC-A', email: 'hc-a@mail.test' }),
+    workerEnv(db),
+  );
+  assert.equal(ok.status, 429);
+});
+
+test('license expires 30 days after activation', async () => {
+  const db = sqliteD1(); seed(db, ['HC-OLD', 'HC-NEW', 'HC-LEGACY']);
+  const daysAgo = (n) => new Date(Date.now() - n * 86400000).toISOString();
+  db.sql.prepare('UPDATE licenses SET bound_at = ? WHERE license_key = ?').run(daysAgo(31), 'HC-OLD');
+  db.sql.prepare('UPDATE licenses SET bound_at = ? WHERE license_key = ?').run(daysAgo(29), 'HC-NEW');
+  const old = await statusCall(db, '8.8.8.8', 'HC-OLD', 'hc-old@mail.test');
+  assert.equal(old.status, 403);
+  assert.match(old.error, /30 hari/);
+  assert.equal((await statusCall(db, '8.8.8.8', 'HC-NEW', 'hc-new@mail.test')).status, 200);
+  assert.equal((await statusCall(db, '8.8.8.8', 'HC-LEGACY', 'hc-legacy@mail.test')).status, 200);
+  const activate = await worker.fetch(
+    ipRequest('/api/activate', '8.8.8.8', '', '', 'POST', { key: 'HC-OLD', email: 'hc-old@mail.test' }),
+    workerEnv(db),
+  );
+  assert.equal(activate.status, 403);
+  assert.equal(db.sql.prepare('SELECT COUNT(*) c FROM auth_attempts').get().c, 0);
+});
+
+test('prune removes only old unlocked attempt rows', async () => {
+  const db = sqliteD1();
+  const now = Math.floor(Date.now() / 1000);
+  db.sql.prepare('INSERT INTO auth_attempts VALUES (?,?,?,?)').run('ip:old', 3, now - 200000, 0);
+  db.sql.prepare('INSERT INTO auth_attempts VALUES (?,?,?,?)').run('ip:locked', 10, now - 200000, now + 600);
+  db.sql.prepare('INSERT INTO auth_attempts VALUES (?,?,?,?)').run('ip:recent', 2, now - 60, 0);
+  await pruneAuthAttempts({ HC_DB: db });
+  const left = db.sql.prepare('SELECT scope_key k FROM auth_attempts ORDER BY k').all().map((r) => r.k);
+  assert.deepEqual(left, ['ip:locked', 'ip:recent']);
 });
