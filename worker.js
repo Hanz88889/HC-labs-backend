@@ -53,7 +53,7 @@ const CORS = {
   'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-License-Key, X-License-Email, X-Admin-Secret, Idempotency-Key',
 };
 
-const BUILD_VERSION = 'phase-8-reconciliation-2026-10-06';
+const BUILD_VERSION = 'phase-9-correctness-url-safety-2026-10-06';
 
 const json = (data, status = 200) =>
   new Response(JSON.stringify(data), {
@@ -62,6 +62,16 @@ const json = (data, status = 200) =>
   });
 
 const err = (msg, status = 400) => json({ error: msg }, status);
+
+function isInternalAssetUrl(value) {
+  if (typeof value !== 'string' || !value.startsWith('/api/assets/')) return false;
+  try {
+    const path = decodeURIComponent(new URL(value, 'https://internal.invalid').pathname);
+    return path.startsWith('/api/assets/generated/');
+  } catch {
+    return false;
+  }
+}
 
 // ─────────────────────────────────────────────
 // TAPERING KUALITAS — berapa kali generate PERTAMA per flow per siklus
@@ -577,6 +587,13 @@ async function resolveFalTask(taskId, license, env) {
   if (!job || job.license_key !== license.key) return { error: 'Task tidak ditemukan', status: 404 };
   const elapsed = elapsedSeconds(job.created_at);
   if (job.status === 'COMPLETED' && job.result_url) {
+    if (!isInternalAssetUrl(job.result_url)) {
+      return { result: {
+        status: 'legacy_result_unsupported', stage: 'migration', elapsed_seconds: elapsed,
+        done: false, failed: true, url: null,
+        error: 'Hasil lama tidak lagi disajikan dari URL provider; kirim generation baru.',
+      } };
+    }
     return { result: { status: 'completed', stage: 'completed', elapsed_seconds: elapsed, done: true, failed: false, url: job.result_url } };
   }
   if (['FAILED', 'EXPIRED', 'CANCELLED'].includes(job.status)) {
@@ -885,8 +902,11 @@ async function handleImageGenerate(request, env) {
     if (reservation.duplicate) {
       const existing = await getGenerationJob(env, reservation.jobId);
       if (!existing) return err('Generation idempotency record tidak lengkap, coba lagi.', 409);
-      if (existing.status === 'COMPLETED' && existing.result_url) {
+      if (existing.status === 'COMPLETED' && existing.result_url && isInternalAssetUrl(existing.result_url)) {
         return json({ type: 'url', url: existing.result_url, provider: 'fal', engine: label, duplicate: true });
+      }
+      if (existing.status === 'COMPLETED' && existing.result_url) {
+        return err('Hasil generation lama perlu dibuat ulang karena belum tersimpan di storage internal.', 410);
       }
       if (!existing.task_id) return err('Generation idempotency record belum memiliki task.', 409);
       return json({ pending: true, taskId: existing.task_id, provider: 'fal', duplicate: true });
@@ -1027,8 +1047,11 @@ async function handleImageEdit(request, env) {
     if (reservation.duplicate) {
       const existing = await getGenerationJob(env, reservation.jobId);
       if (!existing) return err('Generation idempotency record tidak lengkap, coba lagi.', 409);
-      if (existing.status === 'COMPLETED' && existing.result_url) {
+      if (existing.status === 'COMPLETED' && existing.result_url && isInternalAssetUrl(existing.result_url)) {
         return json({ type: 'url', url: existing.result_url, provider: 'fal', engine: label, duplicate: true });
+      }
+      if (existing.status === 'COMPLETED' && existing.result_url) {
+        return err('Hasil generation lama perlu dibuat ulang karena belum tersimpan di storage internal.', 410);
       }
       if (!existing.task_id) return err('Generation idempotency record belum memiliki task.', 409);
       return json({ pending: true, taskId: existing.task_id, provider: 'fal', duplicate: true });

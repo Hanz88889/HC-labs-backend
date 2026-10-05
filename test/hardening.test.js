@@ -223,6 +223,25 @@ test('poll on a completed job returns the stored result without calling the prov
   } finally { globalThis.fetch = originalFetch; }
 });
 
+test('poll refuses a completed job whose result still points to an external provider URL', async () => {
+  const db = sqliteD1(); seed(db);
+  const r = await reserve(db, 'HC-A', 'key-poll-external-result');
+  await settleGenerationAtomic({ HC_DB: db }, {
+    licenseKey: 'HC-A', jobId: r.jobId, attemptId: r.attemptId, creditType: 'video',
+    settlement: 'COMMIT', resultUrl: 'https://provider.example/video.mp4',
+  });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => { throw new Error('provider must not be called'); };
+  try {
+    const token = encodeTaskId('video', 'm', 'req', { j: r.jobId, a: r.attemptId });
+    const res = await worker.fetch(licensedRequest(`/api/videos/status/fal/${token}`, 'HC-A'), workerEnv(db));
+    const data = await res.json();
+    assert.equal(res.status, 200);
+    assert.deepEqual([data.done, data.failed, data.url, data.status], [false, true, null, 'legacy_result_unsupported']);
+    assert.doesNotMatch(JSON.stringify(data), /provider\.example/);
+  } finally { globalThis.fetch = originalFetch; }
+});
+
 test('poll on an expired job reports failure and does not resurrect it', async () => {
   const db = sqliteD1(); seed(db);
   const r = await reserve(db, 'HC-A', 'key-poll-expired');
