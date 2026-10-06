@@ -13,6 +13,17 @@ function creditsOf(entry = {}) {
   };
 }
 
+function limitValueOf(limit) {
+  if (limit && typeof limit === 'object') {
+    return Object.values(limit).reduce((total, value) => {
+      const n = Number(value);
+      return total + (Number.isFinite(n) ? n : 0);
+    }, 0);
+  }
+  const n = Number(limit ?? 0);
+  return Number.isFinite(n) ? n : 0;
+}
+
 export function licenseEntryToRow(key, entry) {
   const credits = creditsOf(entry);
   const premium = entry.premiumUsage || {};
@@ -23,7 +34,7 @@ export function licenseEntryToRow(key, entry) {
     status: entry.status || 'active',
     credits_image: credits.image,
     credits_video: credits.video,
-    limit_value: Number(entry.limit ?? 0),
+    limit_value: limitValueOf(entry.limit),
     reset_date: entry.reset_date || null,
     premium_t2i: Number(premium.t2i ?? 0),
     premium_i2i: Number(premium.i2i ?? 0),

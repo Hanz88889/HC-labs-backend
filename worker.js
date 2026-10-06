@@ -362,13 +362,39 @@ async function handleBulkImport(request, env) {
   if (!Array.isArray(entries)) return err('Body harus array of {key, value} atau object dengan items');
 
   let count = 0;
+  let skipped = 0;
+  const failures = [];
   for (const item of entries) {
-    if (!item.key || !item.value) continue;
-    await env.hc_kv.put(item.key, item.value);
-    count++;
+    if (!item || typeof item.key !== 'string' || !item.key || !item.value) continue;
+    const value = typeof item.value === 'string' ? item.value : JSON.stringify(item.value);
+    if (new TextEncoder().encode(item.key).length > 512) {
+      failures.push({ key: item.key.slice(0, 40), error: 'key terlalu panjang' });
+      continue;
+    }
+    try {
+      if (env.HC_DB && await getD1License(env, item.key)) { skipped++; continue; }
+      let savedToD1 = false;
+      try {
+        const parsed = JSON.parse(value);
+        if (parsed && typeof parsed === 'object' && parsed.credits && parsed.tier) {
+          savedToD1 = await upsertD1License(env, item.key, parsed);
+        }
+      } catch (error) {
+        console.error('bulk-import d1 failed', item.key, error?.message || error);
+      }
+      let kvError = null;
+      try { await env.hc_kv.put(item.key, value); } catch (error) { kvError = error; }
+      if (kvError && !savedToD1) throw kvError;
+      if (kvError) console.error('bulk-import kv failed', item.key, kvError?.message || kvError);
+      count++;
+    } catch (error) {
+      console.error('bulk-import failed', item.key, error?.message || error);
+      failures.push({ key: item.key.slice(0, 40), error: String(error?.message || error).slice(0, 200) });
+    }
   }
 
-  return json({ ok: true, imported: count });
+  if (failures.length && !count && !skipped) return err(`Gagal menyimpan lisensi: ${failures[0].error}`, 500);
+  return json({ ok: failures.length === 0, imported: count, skipped, failed: failures.length, errors: failures.slice(0, 5) });
 }
 
 async function handleD1Migration(request, env) {
@@ -1377,14 +1403,21 @@ async function handleStoredAsset(env, encodedKey) {
 // ─────────────────────────────────────────────
 // MAIN ROUTER
 // ─────────────────────────────────────────────
+function withKvBinding(env) {
+  if (env && !env.hc_kv && env.LICENSE_KV) return { ...env, hc_kv: env.LICENSE_KV };
+  return env;
+}
+
 export default {
-  async scheduled(event, env, ctx) {
+  async scheduled(event, rawEnv, ctx) {
+    const env = withKvBinding(rawEnv);
     ctx.waitUntil(Promise.all([
       expireStaleGenerations(env, { olderThanSeconds: 900, limit: 50 }),
       pruneAuthAttempts(env),
     ]));
   },
-  async fetch(request, env) {
+  async fetch(request, rawEnv) {
+    const env = withKvBinding(rawEnv);
     if (request.method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: CORS });
     }
@@ -1408,6 +1441,7 @@ export default {
       if (path === '/api/diagnostics'     && request.method === 'POST') return await handleDiagnostics(request, env);
       return json({ error: 'Not Found' }, 404);
     } catch (e) {
+      console.error('unhandled', path, e?.stack || e?.message || e);
       return json({ error: 'Internal Server Error' }, 500);
     }
   },
