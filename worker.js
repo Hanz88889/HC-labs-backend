@@ -37,6 +37,7 @@ import {
   blockedMessage, warningMessage, ATTEMPT_LIMITS,
 } from './attempt-guard.js';
 import { selectModelForFlow } from './model-router.js';
+import { analyzeCampaigns, validateAdsCommand } from './ads-agent.js';
 import {
   getD1License, getD1QuotaBalances, upsertD1License, migrateKvLicense, d1Status,
   updateGenerationJob,
@@ -844,6 +845,39 @@ function handleHealth(env) {
 }
 
 // ─────────────────────────────────────────────
+// QUORVANTE ADS AGENT — MVP READ ONLY
+// Angka dihitung backend dari insight terstruktur; endpoint ini tidak pernah
+// menulis ke Meta Ads atau mengubah budget/status campaign.
+// ─────────────────────────────────────────────
+async function handleAdsAgentAnalyze(request, env) {
+  const license = await getValidLicense(request, env);
+  if (!license.ok) return err(license.error, license.status);
+  let body;
+  try { body = await request.json(); }
+  catch { return err('Body JSON tidak valid'); }
+  const command = validateAdsCommand(body?.command || 'Analisa performa campaign');
+  if (!command.ok) return err(command.error);
+  try {
+    const analysis = analyzeCampaigns(body?.campaigns || [], body?.rules || {});
+    return json({ ok: true, command: command.command, analysis });
+  } catch (e) {
+    return err(e?.message || 'Payload insight tidak valid', 422);
+  }
+}
+
+function handleAdsAgentStatus(env) {
+  return json({
+    ok: true,
+    schema: 'quorvante.ads-agent-status.v1',
+    mode: 'READ_ONLY',
+    executionEnabled: false,
+    meta: { connected: false, reason: 'Meta OAuth/insights adapter belum dikonfigurasi' },
+    cloudflare: { worker: true, d1: !!env.HC_DB, r2: !!env.HC_ASSETS, kv: !!env.hc_kv },
+    next: ['META_OAUTH', 'INSIGHTS_SYNC', 'DASHBOARD', 'LLM_ANALYSIS', 'APPROVAL_EXECUTION'],
+  });
+}
+
+// ─────────────────────────────────────────────
 // POST /api/brain/refine — provider-independent Conversation Brain
 // ─────────────────────────────────────────────
 async function handleBrainRefineRoute(request, env) {
@@ -1425,6 +1459,8 @@ export default {
     const parts = path.split('/');
     try {
       if (path === '/api/health')                                        return await handleHealth(env);
+      if (path === '/api/ads-agent/status' && request.method === 'GET') return handleAdsAgentStatus(env);
+      if (path === '/api/ads-agent/analyze' && request.method === 'POST') return await handleAdsAgentAnalyze(request, env);
       if (path.startsWith('/api/assets/') && request.method === 'GET') return await handleStoredAsset(env, path.slice('/api/assets/'.length));
       if (path === '/api/models')                                        return await handleModels(env);
       if (path === '/api/capabilities')                                  return handleCapabilities();
