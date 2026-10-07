@@ -1,4 +1,28 @@
 const MAX_ASSET_BYTES = 250 * 1024 * 1024;
+const MAX_BUFFERED_BYTES = 64 * 1024 * 1024;
+
+async function readCapped(body, limit) {
+  const reader = body.getReader();
+  const chunks = [];
+  let total = 0;
+  while (true) {
+    const part = await reader.read();
+    if (part.done) break;
+    total += part.value.byteLength;
+    if (total > limit) {
+      await reader.cancel().catch(() => null);
+      throw new Error('ASSET_TOO_LARGE');
+    }
+    chunks.push(part.value);
+  }
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return merged;
+}
 
 function expectedTypeForFlow(flow) {
   return flow === 't2i' || flow === 'i2i' ? 'image' : 'video';
@@ -30,33 +54,20 @@ export async function persistGeneratedAsset(env, { flow, jobId, attemptId, sourc
   if (advertisedBytes > MAX_ASSET_BYTES) return { ok: false, reason: 'SOURCE_ASSET_TOO_LARGE' };
 
   const key = `generated/${jobId}/${attemptId}.${extensionFor(contentType, expectedType)}`;
-  const { readable, writable } = new TransformStream();
-  const reader = response.body.getReader();
-  const writer = writable.getWriter();
+  const putOptions = {
+    httpMetadata: { contentType, cacheControl: 'public, max-age=86400' },
+    customMetadata: { job_id: jobId, attempt_id: attemptId, flow },
+  };
   let bytes = 0;
-  const pump = (async () => {
-    try {
-      while (true) {
-        const part = await reader.read();
-        if (part.done) break;
-        bytes += part.value.byteLength;
-        if (bytes > MAX_ASSET_BYTES) throw new Error('ASSET_TOO_LARGE');
-        await writer.write(part.value);
-      }
-      await writer.close();
-    } catch (error) {
-      await writer.abort(error);
-      throw error;
-    }
-  })();
-
   try {
-    const upload = env.HC_ASSETS.put(key, readable, {
-      httpMetadata: { contentType, cacheControl: 'public, max-age=86400' },
-      customMetadata: { job_id: jobId, attempt_id: attemptId, flow },
-    });
-    await pump;
-    await upload;
+    if (advertisedBytes > 0) {
+      await env.HC_ASSETS.put(key, response.body, putOptions);
+      bytes = advertisedBytes;
+    } else {
+      const data = await readCapped(response.body, MAX_BUFFERED_BYTES);
+      await env.HC_ASSETS.put(key, data, putOptions);
+      bytes = data.byteLength;
+    }
   } catch (error) {
     return { ok: false, reason: error.message === 'ASSET_TOO_LARGE' ? 'SOURCE_ASSET_TOO_LARGE' : 'R2_PUT_FAILED' };
   }
