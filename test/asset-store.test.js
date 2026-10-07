@@ -14,8 +14,7 @@ test('persists a streamed image and returns an internal asset URL', async () => 
       HC_ASSETS: {
         async put(key, value, options) {
           objects.set(key, { value, options });
-          const reader = value.getReader();
-          while (!(await reader.read()).done) { /* consume stream */ }
+          if (value instanceof ReadableStream) await new Response(value).arrayBuffer();
         },
       },
     };
